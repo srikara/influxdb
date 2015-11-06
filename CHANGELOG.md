@@ -2,6 +2,7 @@
 
 ### Release Notes
 
+
 - Field names for the internal stats have been changed to be more inline with Go style.
 
 There are breaking changes in this release:
