@@ -1,17 +1,20 @@
 #!/bin/sh
 BIN_DIR=/usr/bin
 DATA_DIR=/var/lib/influxdb
+LOG_DIR=/var/log/influxdb
+SCRIPT_DIR=/usr/lib/influxdb/scripts
+LOGROTATE_DIR=/etc/logrotate.d
 
 if ! id influxdb >/dev/null 2>&1; then
-        useradd --system -U -M influxdb -s /bin/false -d $INFLUXDB_DATA_DIR
+        useradd --system -U -M influxdb -s /bin/false -d $DATA_DIR
 fi
 chown influxdb:influxdb $BIN_DIR/influx*
-chmod a+rX $INSTALL_ROOT_DIR/influx*
+chmod a+rX $BIN_DIR/influx*
 
-mkdir -p $INFLUXDB_LOG_DIR
-chown -R -L influxdb:influxdb $INFLUXDB_LOG_DIR
-mkdir -p $INFLUXDB_DATA_DIR
-chown -R -L influxdb:influxdb $INFLUXDB_DATA_DIR
+mkdir -p $LOG_DIR
+chown -R -L influxdb:influxdb $LOG_DIR
+mkdir -p $DATA_DIR
+chown -R -L influxdb:influxdb $DATA_DIR
 
 test -f /etc/default/influxdb || touch /etc/default/influxdb
 
@@ -23,12 +26,12 @@ test -h /etc/init.d/influxdb && rm -f /etc/init.d/influxdb
 
 # Systemd
 if which systemctl > /dev/null 2>&1 ; then
-    cp $INFLUXDB_SCRIPT_DIR/$SYSTEMD_SCRIPT /lib/systemd/system/influxdb.service
+    cp $SCRIPT_DIR/influxdb.service /lib/systemd/system/influxdb.service
     systemctl enable influxdb
 
 # Sysv
 else
-    cp -f $INFLUXDB_SCRIPT_DIR/$INITD_SCRIPT /etc/init.d/influxdb
+    cp -f $SCRIPT_DIR/init.sh /etc/init.d/influxdb
     chmod +x /etc/init.d/influxdb
     if which update-rc.d > /dev/null 2>&1 ; then
         update-rc.d -f influxdb remove
