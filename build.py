@@ -341,7 +341,7 @@ def build_packages(build_output, version, rc=None):
                     name = "influxdb"
                     if package_type in ['zip', 'tar']:
                         name = '{}-{}_{}_{}'.format(name, version, p, a)
-                    fpm_command = "fpm {} --name {} -t {} --version {} -C {} -p {}".format(
+                    fpm_command = "fpm {} --name {} -t {} --version {} -C {} -p {} ".format(
                         fpm_common_args,
                         name,
                         package_type,
@@ -349,11 +349,11 @@ def build_packages(build_output, version, rc=None):
                         build_root,
                         current_location)
                     if package_type == "rpm":
-                        fpm_command += "--depends coreutils"
+                        fpm_command += "--depends coreutils "
                         if rc:
-                            fpm_command += "--iteration {}".format(rc)
+                            fpm_command += "--iteration {} ".format(rc)
                         else:
-                            fpm_command += "--iteration 1"
+                            fpm_command += "--iteration 1 "
                     out = run(fpm_command, shell=True)
                     matches = re.search(':path=>"(.*)"', out)
                     outfile = None
