@@ -309,7 +309,7 @@ def package_scripts(build_root):
     shutil.copyfile(LOGROTATE_SCRIPT, os.path.join(build_root, SCRIPT_DIR[1:], LOGROTATE_SCRIPT.split('/')[1]))
     shutil.copyfile(DEFAULT_CONFIG, os.path.join(build_root, CONFIG_DIR[1:], DEFAULT_CONFIG.split('/')[1]))
     
-def build_packages(build_output, version):
+def build_packages(build_output, version, rc=None):
     outfiles = []
     tmp_build_dir = create_temp_dir()
     try:
@@ -347,6 +347,12 @@ def build_packages(build_output, version):
                         version,
                         build_root,
                         current_location)
+                    if package_type == "rpm":
+                        fpm_command += "--depends coreutils"
+                        if rc:
+                            fpm_command += "--iteration {}".format(rc)
+                        else:
+                            fpm_command += "--iteration 1"
                     out = run(fpm_command, shell=True)
                     matches = re.search(':path=>"(.*)"', out)
                     outfile = None
@@ -373,7 +379,7 @@ def print_usage():
     print "\t --version=<version> \n\t\t- Version information to apply to build metadata. If not specified, will be pulled from repo tag."
     print "\t --commit=<commit> \n\t\t- Use specific commit for build (currently a NOOP)."
     print "\t --branch=<branch> \n\t\t- Build from a specific branch (currently a NOOP)."
-    print "\t --rc \n\t\t- Whether or not the build is a release candidate (affects version information)."
+    print "\t --rc=<rc number> \n\t\t- Whether or not the build is a release candidate (affects version information)."
     print "\t --race \n\t\t- Whether the produced build should have race detection enabled."
     print "\t --package \n\t\t- Whether the produced builds should be packaged for the target platform(s)."
     print "\t --nightly \n\t\t- Whether the produced build is a nightly (affects version information)."
@@ -529,7 +535,7 @@ def main():
         if not check_path_for("fpm"):
             print "!! Cannot package without command 'fpm'. Stopping."
             sys.exit(1)
-        packages = build_packages(build_output, version)
+        packages = build_packages(build_output, version, rc=rc)
         # Optionally upload to S3
         if upload:
             upload_packages(packages)
