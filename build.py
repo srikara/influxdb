@@ -16,6 +16,7 @@ import datetime
 import shutil
 import tempfile
 import hashlib
+import re
 
 try:
     import boto
