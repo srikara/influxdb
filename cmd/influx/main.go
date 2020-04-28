@@ -1,813 +1,511 @@
 package main
 
 import (
-	"encoding/csv"
+	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
-	"net"
-	"net/url"
+	"io/ioutil"
 	"os"
-	"os/user"
 	"path/filepath"
-	"sort"
-	"strconv"
 	"strings"
-	"text/tabwriter"
+	"sync"
 
-	"github.com/influxdb/influxdb/client"
-	"github.com/influxdb/influxdb/cluster"
-	"github.com/influxdb/influxdb/importer/v8"
-	"github.com/peterh/liner"
+	"github.com/influxdata/influxdb/v2"
+	"github.com/influxdata/influxdb/v2/bolt"
+	"github.com/influxdata/influxdb/v2/cmd/influx/config"
+	"github.com/influxdata/influxdb/v2/cmd/influx/internal"
+	"github.com/influxdata/influxdb/v2/http"
+	"github.com/influxdata/influxdb/v2/internal/fs"
+	"github.com/influxdata/influxdb/v2/kit/cli"
+	"github.com/influxdata/influxdb/v2/kv"
+	"github.com/influxdata/influxdb/v2/pkg/httpc"
+	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
+	"go.uber.org/zap"
 )
 
-// These variables are populated via the Go linker.
-var (
-	version string = "0.9"
-)
-
-const (
-	// defaultFormat is the default format of the results when issuing queries
-	defaultFormat = "column"
-
-	// defaultPrecision is the default timestamp format of the results when issuing queries
-	defaultPrecision = "ns"
-
-	// defaultPPS is the default points per second that the import will throttle at
-	// by default it's 0, which means it will not throttle
-	defaultPPS = 0
-)
-
-const (
-	noTokenMsg = "Visit https://enterprise.influxdata.com to register for updates, InfluxDB server management, and monitoring.\n"
-)
-
-type CommandLine struct {
-	Client           *client.Client
-	Line             *liner.State
-	Host             string
-	Port             int
-	Username         string
-	Password         string
-	Database         string
-	Ssl              bool
-	RetentionPolicy  string
-	Version          string
-	Pretty           bool   // controls pretty print for json
-	Format           string // controls the output format.  Valid values are json, csv, or column
-	Precision        string
-	WriteConsistency string
-	Execute          string
-	ShowVersion      bool
-	Import           bool
-	PPS              int // Controls how many points per second the import will allow via throttling
-	Path             string
-	Compressed       bool
-}
+const maxTCPConnections = 10
 
 func main() {
-	c := CommandLine{}
-
-	fs := flag.NewFlagSet("InfluxDB shell version "+version, flag.ExitOnError)
-	fs.StringVar(&c.Host, "host", client.DefaultHost, "Influxdb host to connect to.")
-	fs.IntVar(&c.Port, "port", client.DefaultPort, "Influxdb port to connect to.")
-	fs.StringVar(&c.Username, "username", c.Username, "Username to connect to the server.")
-	fs.StringVar(&c.Password, "password", c.Password, `Password to connect to the server.  Leaving blank will prompt for password (--password="").`)
-	fs.StringVar(&c.Database, "database", c.Database, "Database to connect to the server.")
-	fs.BoolVar(&c.Ssl, "ssl", false, "Use https for connecting to cluster.")
-	fs.StringVar(&c.Format, "format", defaultFormat, "Format specifies the format of the server responses:  json, csv, or column.")
-	fs.StringVar(&c.Precision, "precision", defaultPrecision, "Precision specifies the format of the timestamp:  rfc3339,h,m,s,ms,u or ns.")
-	fs.StringVar(&c.WriteConsistency, "consistency", "any", "Set write consistency level: any, one, quorum, or all.")
-	fs.BoolVar(&c.Pretty, "pretty", false, "Turns on pretty print for the json format.")
-	fs.StringVar(&c.Execute, "execute", c.Execute, "Execute command and quit.")
-	fs.BoolVar(&c.ShowVersion, "version", false, "Displays the InfluxDB version.")
-	fs.BoolVar(&c.Import, "import", false, "Import a previous database.")
-	fs.IntVar(&c.PPS, "pps", defaultPPS, "How many points per second the import will allow.  By default it is zero and will not throttle importing.")
-	fs.StringVar(&c.Path, "path", "", "path to the file to import")
-	fs.BoolVar(&c.Compressed, "compressed", false, "set to true if the import file is compressed")
-
-	// Define our own custom usage to print
-	fs.Usage = func() {
-		fmt.Println(`Usage of influx:
-  -version
-       Display the version and exit.
-  -host 'host name'
-       Host to connect to.
-  -port 'port #'
-       Port to connect to.
-  -database 'database name'
-       Database to connect to the server.
-  -password 'password'
-      Password to connect to the server.  Leaving blank will prompt for password (--password '').
-  -username 'username'
-       Username to connect to the server.
-  -ssl
-        Use https for requests.
-  -execute 'command'
-       Execute command and quit.
-  -format 'json|csv|column'
-       Format specifies the format of the server responses:  json, csv, or column.
-  -precision 'rfc3339|h|m|s|ms|u|ns'
-       Precision specifies the format of the timestamp:  rfc3339, h, m, s, ms, u or ns.
-  -consistency 'any|one|quorum|all'
-       Set write consistency level: any, one, quorum, or all
-  -pretty
-       Turns on pretty print for the json format.
-  -import
-       Import a previous database export from file
-  -pps
-       How many points per second the import will allow.  By default it is zero and will not throttle importing.
-  -path
-       Path to file to import
-  -compressed
-       Set to true if the import file is compressed
-
-Examples:
-
-    # Use influx in a non-interactive mode to query the database "metrics" and pretty print json:
-    $ influx -database 'metrics' -execute 'select * from cpu' -format 'json' -pretty
-
-    # Connect to a specific database on startup and set database context:
-    $ influx -database 'metrics' -host 'localhost' -port '8086'
-`)
-	}
-	fs.Parse(os.Args[1:])
-
-	if c.ShowVersion {
-		showVersion()
-		os.Exit(0)
-	}
-
-	var promptForPassword bool
-	// determine if they set the password flag but provided no value
-	for _, v := range os.Args {
-		v = strings.ToLower(v)
-		if (strings.HasPrefix(v, "-password") || strings.HasPrefix(v, "--password")) && c.Password == "" {
-			promptForPassword = true
-			break
-		}
-	}
-
-	c.Line = liner.NewLiner()
-	defer c.Line.Close()
-
-	if promptForPassword {
-		p, e := c.Line.PasswordPrompt("password: ")
-		if e != nil {
-			fmt.Println("Unable to parse password.")
-		} else {
-			c.Password = p
-		}
-	}
-
-	if err := c.connect(""); err != nil {
-		fmt.Fprintf(os.Stderr,
-			"Failed to connect to %s\nPlease check your connection settings and ensure 'influxd' is running.\n",
-			c.Client.Addr())
-		return
-	}
-
-	if c.Execute == "" && !c.Import {
-		token, err := c.DatabaseToken()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to check token: %s\n", err.Error())
-			return
-		}
-		if token == "" {
-			fmt.Printf(noTokenMsg)
-		}
-		fmt.Printf("Connected to %s version %s\n", c.Client.Addr(), c.Version)
-	}
-
-	if c.Execute != "" {
-		// Modify precision before executing query
-		c.SetPrecision(c.Precision)
-		if err := c.ExecuteQuery(c.Execute); err != nil {
-			c.Line.Close()
-			os.Exit(1)
-		}
-		c.Line.Close()
-		os.Exit(0)
-	}
-
-	if c.Import {
-		path := net.JoinHostPort(c.Host, strconv.Itoa(c.Port))
-		u, e := client.ParseConnectionString(path, c.Ssl)
-		if e != nil {
-			fmt.Println(e)
-			return
-		}
-
-		config := v8.NewConfig()
-		config.Username = c.Username
-		config.Password = c.Password
-		config.Precision = "ns"
-		config.WriteConsistency = "any"
-		config.Path = c.Path
-		config.Version = version
-		config.URL = u
-		config.Compressed = c.Compressed
-		config.PPS = c.PPS
-		config.Precision = c.Precision
-
-		i := v8.NewImporter(config)
-		if err := i.Import(); err != nil {
-			fmt.Printf("ERROR: %s\n", err)
-			c.Line.Close()
-			os.Exit(1)
-		}
-		c.Line.Close()
-		os.Exit(0)
-	}
-
-	showVersion()
-
-	var historyFile string
-	usr, err := user.Current()
-	// Only load history if we can get the user
-	if err == nil {
-		historyFile = filepath.Join(usr.HomeDir, ".influx_history")
-
-		if f, err := os.Open(historyFile); err == nil {
-			c.Line.ReadHistory(f)
-			f.Close()
-		}
-	}
-
-	for {
-		l, e := c.Line.Prompt("> ")
-		if e != nil {
-			break
-		}
-		if c.ParseCommand(l) {
-			// write out the history
-			if len(historyFile) > 0 {
-				c.Line.AppendHistory(l)
-				if f, err := os.Create(historyFile); err == nil {
-					c.Line.WriteHistory(f)
-					f.Close()
-				}
-			}
-		} else {
-			break // exit main loop
-		}
+	influxCmd := influxCmd()
+	if err := influxCmd.Execute(); err != nil {
+		seeHelp(influxCmd, nil)
+		os.Exit(1)
 	}
 }
 
-func showVersion() {
-	fmt.Println("InfluxDB shell " + version)
-}
+var (
+	httpClient *httpc.Client
+)
 
-func (c *CommandLine) ParseCommand(cmd string) bool {
-	lcmd := strings.TrimSpace(strings.ToLower(cmd))
-	switch {
-	case strings.HasPrefix(lcmd, "exit"):
-		// signal the program to exit
-		return false
-	case strings.HasPrefix(lcmd, "gopher"):
-		c.gopher()
-	case strings.HasPrefix(lcmd, "connect"):
-		c.connect(cmd)
-	case strings.HasPrefix(lcmd, "auth"):
-		c.SetAuth(cmd)
-	case strings.HasPrefix(lcmd, "help"):
-		c.help()
-	case strings.HasPrefix(lcmd, "format"):
-		c.SetFormat(cmd)
-	case strings.HasPrefix(lcmd, "precision"):
-		c.SetPrecision(cmd)
-	case strings.HasPrefix(lcmd, "consistency"):
-		c.SetWriteConsistency(cmd)
-	case strings.HasPrefix(lcmd, "settings"):
-		c.Settings()
-	case strings.HasPrefix(lcmd, "pretty"):
-		c.Pretty = !c.Pretty
-		if c.Pretty {
-			fmt.Println("Pretty print enabled")
-		} else {
-			fmt.Println("Pretty print disabled")
-		}
-	case strings.HasPrefix(lcmd, "use"):
-		c.use(cmd)
-	case strings.HasPrefix(lcmd, "insert"):
-		c.Insert(cmd)
-	case lcmd == "":
-		break
-	default:
-		c.ExecuteQuery(cmd)
-	}
-	return true
-}
-
-func (c *CommandLine) connect(cmd string) error {
-	var cl *client.Client
-	var u url.URL
-
-	// Remove the "connect" keyword if it exists
-	path := strings.TrimSpace(strings.Replace(cmd, "connect", "", -1))
-
-	// If they didn't provide a connection string, use the current settings
-	if path == "" {
-		path = net.JoinHostPort(c.Host, strconv.Itoa(c.Port))
+func newHTTPClient() (*httpc.Client, error) {
+	if httpClient != nil {
+		return httpClient, nil
 	}
 
-	var e error
-	u, e = client.ParseConnectionString(path, c.Ssl)
-	if e != nil {
-		return e
-	}
-
-	config := client.NewConfig()
-	config.URL = u
-	config.Username = c.Username
-	config.Password = c.Password
-	config.UserAgent = "InfluxDBShell/" + version
-	config.Precision = c.Precision
-	cl, err := client.NewClient(config)
+	c, err := http.NewHTTPClient(flags.Host, flags.Token, flags.skipVerify)
 	if err != nil {
-		return fmt.Errorf("Could not create client %s", err)
+		return nil, err
 	}
-	c.Client = cl
-	if _, v, e := c.Client.Ping(); e != nil {
-		return fmt.Errorf("Failed to connect to %s\n", c.Client.Addr())
-	} else {
-		c.Version = v
-	}
-	return nil
+
+	httpClient = c
+	return httpClient, nil
 }
 
-func (c *CommandLine) SetAuth(cmd string) {
-	// If they pass in the entire command, we should parse it
-	// auth <username> <password>
-	args := strings.Fields(cmd)
-	if len(args) == 3 {
-		args = args[1:]
-	} else {
-		args = []string{}
-	}
+type (
+	cobraRunEFn func(cmd *cobra.Command, args []string) error
 
-	if len(args) == 2 {
-		c.Username = args[0]
-		c.Password = args[1]
-	} else {
-		u, e := c.Line.Prompt("username: ")
-		if e != nil {
-			fmt.Printf("Unable to process input: %s", e)
-			return
-		}
-		c.Username = strings.TrimSpace(u)
-		p, e := c.Line.PasswordPrompt("password: ")
-		if e != nil {
-			fmt.Printf("Unable to process input: %s", e)
-			return
-		}
-		c.Password = p
-	}
+	cobraRunEMiddleware func(fn cobraRunEFn) cobraRunEFn
 
-	// Update the client as well
-	c.Client.SetAuth(c.Username, c.Password)
+	genericCLIOptFn func(*genericCLIOpts)
+)
+
+type genericCLIOpts struct {
+	in   io.Reader
+	w    io.Writer
+	errW io.Writer
+
+	runEWrapFn cobraRunEMiddleware
 }
 
-func (c *CommandLine) use(cmd string) {
-	args := strings.Split(strings.TrimSuffix(strings.TrimSpace(cmd), ";"), " ")
-	if len(args) != 2 {
-		fmt.Printf("Could not parse database name from %q.\n", cmd)
-		return
+func (o genericCLIOpts) newCmd(use string, runE func(*cobra.Command, []string) error, useRunEMiddleware bool) *cobra.Command {
+	cmd := &cobra.Command{
+		Args: cobra.NoArgs,
+		Use:  use,
+		RunE: runE,
 	}
-	d := args[1]
-	c.Database = d
-	fmt.Printf("Using database %s\n", d)
+
+	canWrapRunE := runE != nil && o.runEWrapFn != nil
+	if useRunEMiddleware && canWrapRunE {
+		cmd.RunE = o.runEWrapFn(runE)
+	} else if canWrapRunE {
+		cmd.RunE = runE
+	}
+
+	cmd.SetOut(o.w)
+	cmd.SetIn(o.in)
+	cmd.SetErr(o.errW)
+	return cmd
 }
 
-func (c *CommandLine) SetPrecision(cmd string) {
-	// Remove the "precision" keyword if it exists
-	cmd = strings.TrimSpace(strings.Replace(cmd, "precision", "", -1))
-	// normalize cmd
-	cmd = strings.ToLower(cmd)
+func (o genericCLIOpts) writeJSON(v interface{}) error {
+	return writeJSON(o.w, v)
+}
 
-	switch cmd {
-	case "h", "m", "s", "ms", "u", "ns":
-		c.Precision = cmd
-		c.Client.SetPrecision(c.Precision)
-	case "rfc3339":
-		c.Precision = ""
-		c.Client.SetPrecision(c.Precision)
-	default:
-		fmt.Printf("Unknown precision %q. Please use rfc3339, h, m, s, ms, u or ns.\n", cmd)
+func (o genericCLIOpts) newTabWriter() *internal.TabWriter {
+	return internal.NewTabWriter(o.w)
+}
+
+func in(r io.Reader) genericCLIOptFn {
+	return func(o *genericCLIOpts) {
+		o.in = r
 	}
 }
 
-func (c *CommandLine) SetFormat(cmd string) {
-	// Remove the "format" keyword if it exists
-	cmd = strings.TrimSpace(strings.Replace(cmd, "format", "", -1))
-	// normalize cmd
-	cmd = strings.ToLower(cmd)
-
-	switch cmd {
-	case "json", "csv", "column":
-		c.Format = cmd
-	default:
-		fmt.Printf("Unknown format %q. Please use json, csv, or column.\n", cmd)
+func out(w io.Writer) genericCLIOptFn {
+	return func(o *genericCLIOpts) {
+		o.w = w
 	}
 }
 
-func (c *CommandLine) SetWriteConsistency(cmd string) {
-	// Remove the "consistency" keyword if it exists
-	cmd = strings.TrimSpace(strings.Replace(cmd, "consistency", "", -1))
-	// normalize cmd
-	cmd = strings.ToLower(cmd)
-
-	_, err := cluster.ParseConsistencyLevel(cmd)
-	if err != nil {
-		fmt.Printf("Unknown consistency level %q. Please use any, one, quorum, or all.\n", cmd)
-		return
+func err(w io.Writer) genericCLIOptFn {
+	return func(o *genericCLIOpts) {
+		o.errW = w
 	}
-	c.WriteConsistency = cmd
 }
 
-// isWhitespace returns true if the rune is a space, tab, or newline.
-func isWhitespace(ch rune) bool { return ch == ' ' || ch == '\t' || ch == '\n' }
-
-// isLetter returns true if the rune is a letter.
-func isLetter(ch rune) bool { return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') }
-
-// isDigit returns true if the rune is a digit.
-func isDigit(ch rune) bool { return (ch >= '0' && ch <= '9') }
-
-// isIdentFirstChar returns true if the rune can be used as the first char in an unquoted identifer.
-func isIdentFirstChar(ch rune) bool { return isLetter(ch) || ch == '_' }
-
-// isIdentChar returns true if the rune can be used in an unquoted identifier.
-func isNotIdentChar(ch rune) bool { return !(isLetter(ch) || isDigit(ch) || ch == '_') }
-
-func parseUnquotedIdentifier(stmt string) (string, string) {
-	if fields := strings.FieldsFunc(stmt, isNotIdentChar); len(fields) > 0 {
-		return fields[0], strings.TrimPrefix(stmt, fields[0])
+func runEMiddlware(mw cobraRunEMiddleware) genericCLIOptFn {
+	return func(o *genericCLIOpts) {
+		o.runEWrapFn = mw
 	}
-	return "", stmt
 }
 
-func parseDoubleQuotedIdentifier(stmt string) (string, string) {
-	escapeNext := false
-	fields := strings.FieldsFunc(stmt, func(ch rune) bool {
-		if ch == '\\' {
-			escapeNext = true
-		} else if ch == '"' {
-			if !escapeNext {
-				return true
-			}
-			escapeNext = false
-		}
-		return false
+type globalFlags struct {
+	config.Config
+	local      bool
+	skipVerify bool
+}
+
+var flags globalFlags
+
+type cmdInfluxBuilder struct {
+	genericCLIOpts
+
+	once sync.Once
+}
+
+func newInfluxCmdBuilder(optFns ...genericCLIOptFn) *cmdInfluxBuilder {
+	builder := new(cmdInfluxBuilder)
+
+	opt := genericCLIOpts{
+		in:         os.Stdin,
+		w:          os.Stdout,
+		errW:       os.Stderr,
+		runEWrapFn: checkSetupRunEMiddleware(&flags),
+	}
+	for _, optFn := range optFns {
+		optFn(&opt)
+	}
+
+	builder.genericCLIOpts = opt
+	return builder
+}
+
+func (b *cmdInfluxBuilder) cmd(childCmdFns ...func(f *globalFlags, opt genericCLIOpts) *cobra.Command) *cobra.Command {
+	b.once.Do(func() {
+		// enforce that viper options only ever get set once
+		setViperOptions()
 	})
-	if len(fields) > 0 {
-		return fields[0], strings.TrimPrefix(stmt, "\""+fields[0]+"\"")
+
+	cmd := b.newCmd("influx", nil, false)
+	cmd.Short = "Influx Client"
+	cmd.SilenceUsage = true
+
+	for _, childCmd := range childCmdFns {
+		cmd.AddCommand(childCmd(&flags, b.genericCLIOpts))
 	}
-	return "", stmt
+
+	fOpts := flagOpts{
+		{
+			DestP:      &flags.Token,
+			Flag:       "token",
+			Short:      't',
+			Desc:       "API token to be used throughout client calls",
+			Persistent: true,
+		},
+		{
+			DestP:      &flags.Host,
+			Flag:       "host",
+			Desc:       "HTTP address of Influx",
+			Persistent: true,
+		},
+	}
+	fOpts.mustRegister(cmd)
+
+	// migration credential token
+	migrateOldCredential()
+
+	// this is after the flagOpts register b/c we don't want to show the default value
+	// in the usage display. This will add it as the config, then if a token flag
+	// is provided too, the flag will take precedence.
+	cfg := getConfigFromDefaultPath()
+
+	// we have some indirection here b/c of how the Config is embedded on the
+	// global flags type. For the time being, we check to see if there was a
+	// value set on flags registered (via env vars), and override the host/token
+	// values if they are.
+	if flags.Token != "" {
+		cfg.Token = flags.Token
+	}
+	if flags.Host != "" {
+		cfg.Host = flags.Host
+	}
+	flags.Config = cfg
+
+	cmd.PersistentFlags().BoolVar(&flags.local, "local", false, "Run commands locally against the filesystem")
+	cmd.PersistentFlags().BoolVar(&flags.skipVerify, "skip-verify", false, "SkipVerify controls whether a client verifies the server's certificate chain and host name.")
+
+	// Update help description for all commands in command tree
+	walk(cmd, func(c *cobra.Command) {
+		c.Flags().BoolP("help", "h", false, fmt.Sprintf("Help for the %s command ", c.Name()))
+	})
+
+	// completion command goes last, after the walk, so that all
+	// commands have every flag listed in the bash|zsh completions.
+	cmd.AddCommand(completionCmd(cmd))
+	return cmd
 }
 
-func parseNextIdentifier(stmt string) (ident, remainder string) {
-	if len(stmt) > 0 {
-		switch {
-		case isWhitespace(rune(stmt[0])):
-			return parseNextIdentifier(stmt[1:])
-		case isIdentFirstChar(rune(stmt[0])):
-			return parseUnquotedIdentifier(stmt)
-		case stmt[0] == '"':
-			return parseDoubleQuotedIdentifier(stmt)
-		}
-	}
-	return "", stmt
+func influxCmd(opts ...genericCLIOptFn) *cobra.Command {
+	builder := newInfluxCmdBuilder(opts...)
+	return builder.cmd(
+		cmdAuth,
+		cmdBackup,
+		cmdBucket,
+		cmdDelete,
+		cmdOrganization,
+		cmdPing,
+		cmdPkg,
+		cmdConfig,
+		cmdQuery,
+		cmdTranspile,
+		cmdREPL,
+		cmdSecret,
+		cmdSetup,
+		cmdTask,
+		cmdUser,
+		cmdWrite,
+	)
 }
 
-func (c *CommandLine) parseInto(stmt string) string {
-	ident, stmt := parseNextIdentifier(stmt)
-	if strings.HasPrefix(stmt, ".") {
-		c.Database = ident
-		fmt.Printf("Using database %s\n", c.Database)
-		ident, stmt = parseNextIdentifier(stmt[1:])
-	}
-	if strings.HasPrefix(stmt, " ") {
-		c.RetentionPolicy = ident
-		fmt.Printf("Using retention policy %s\n", c.RetentionPolicy)
-		return stmt[1:]
-	}
-	return stmt
-}
+func fetchSubCommand(parent *cobra.Command, args []string) *cobra.Command {
+	var err error
+	var cmd *cobra.Command
 
-func (c *CommandLine) Insert(stmt string) error {
-	i, point := parseNextIdentifier(stmt)
-	if !strings.EqualFold(i, "insert") {
-		fmt.Printf("ERR: found %s, expected INSERT\n", i)
+	// Workaround FAIL with "go test -v" or "cobra.test -test.v", see #155
+	if args == nil && filepath.Base(os.Args[0]) != "cobra.test" {
+		args = os.Args[1:]
+	}
+
+	if parent.TraverseChildren {
+		cmd, _, err = parent.Traverse(args)
+	} else {
+		cmd, _, err = parent.Find(args)
+	}
+	// return nil if any errs
+	if err != nil {
 		return nil
 	}
-	if i, r := parseNextIdentifier(point); strings.EqualFold(i, "into") {
-		point = c.parseInto(r)
-	}
-	_, err := c.Client.Write(client.BatchPoints{
-		Points: []client.Point{
-			client.Point{Raw: point},
-		},
-		Database:         c.Database,
-		RetentionPolicy:  c.RetentionPolicy,
-		Precision:        "n",
-		WriteConsistency: c.WriteConsistency,
-	})
-	if err != nil {
-		fmt.Printf("ERR: %s\n", err)
-		if c.Database == "" {
-			fmt.Println("Note: error may be due to not setting a database or retention policy.")
-			fmt.Println(`Please set a database with the command "use <database>" or`)
-			fmt.Println("INSERT INTO <database>.<retention-policy> <point>")
-		}
-		return err
-	}
-	return nil
+	return cmd
 }
 
-func (c *CommandLine) ExecuteQuery(query string) error {
-	response, err := c.Client.Query(client.Query{Command: query, Database: c.Database})
-	if err != nil {
-		fmt.Printf("ERR: %s\n", err)
-		return err
+func seeHelp(c *cobra.Command, args []string) {
+	if c = fetchSubCommand(c, args); c == nil {
+		return //return here, since cobra already handles the error
 	}
-	c.FormatResponse(response, os.Stdout)
-	if err := response.Error(); err != nil {
-		fmt.Printf("ERR: %s\n", response.Error())
-		if c.Database == "" {
-			fmt.Println("Warning: It is possible this error is due to not setting a database.")
-			fmt.Println(`Please set a database with the command "use <database>".`)
-		}
-		return err
-	}
-	return nil
+	c.Printf("See '%s -h' for help\n", c.CommandPath())
 }
 
-func (c *CommandLine) DatabaseToken() (string, error) {
-	response, err := c.Client.Query(client.Query{Command: "SHOW DIAGNOSTICS for 'registration'"})
+func defaultConfigPath() (string, string, error) {
+	dir, err := fs.InfluxDir()
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	if response.Error() != nil || len((*response).Results[0].Series) == 0 {
-		return "", nil
-	}
-
-	// Look for position of "token" column.
-	for i, s := range (*response).Results[0].Series[0].Columns {
-		if s == "token" {
-			return (*response).Results[0].Series[0].Values[0][i].(string), nil
-		}
-	}
-	return "", nil
+	return filepath.Join(dir, http.DefaultConfigsFile), dir, nil
 }
 
-func (c *CommandLine) FormatResponse(response *client.Response, w io.Writer) {
-	switch c.Format {
-	case "json":
-		c.writeJSON(response, w)
-	case "csv":
-		c.writeCSV(response, w)
-	case "column":
-		c.writeColumns(response, w)
-	default:
-		fmt.Fprintf(w, "Unknown output format %q.\n", c.Format)
+func getConfigFromDefaultPath() config.Config {
+	path, _, err := defaultConfigPath()
+	if err != nil {
+		return config.DefaultConfig
 	}
+	r, err := os.Open(path)
+	if err != nil {
+		return config.DefaultConfig
+	}
+	activated, err := config.ParseActiveConfig(r)
+	if err != nil {
+		return config.DefaultConfig
+	}
+	return activated
 }
 
-func (c *CommandLine) writeJSON(response *client.Response, w io.Writer) {
-	var data []byte
-	var err error
-	if c.Pretty {
-		data, err = json.MarshalIndent(response, "", "    ")
-	} else {
-		data, err = json.Marshal(response)
-	}
+func migrateOldCredential() {
+	dir, err := fs.InfluxDir()
 	if err != nil {
-		fmt.Fprintf(w, "Unable to parse json: %s\n", err)
+		return // no need for migration
+	}
+
+	tokB, err := ioutil.ReadFile(filepath.Join(dir, http.DefaultTokenFile))
+	if err != nil {
+		return // no need for migration
+	}
+
+	err = writeConfigToPath(strings.TrimSpace(string(tokB)), "", filepath.Join(dir, http.DefaultConfigsFile), dir)
+	if err != nil {
 		return
 	}
-	fmt.Fprintln(w, string(data))
+
+	// ignore the remove err
+	_ = os.Remove(filepath.Join(dir, http.DefaultTokenFile))
 }
 
-func (c *CommandLine) writeCSV(response *client.Response, w io.Writer) {
-	csvw := csv.NewWriter(w)
-	for _, result := range response.Results {
-		// Create a tabbed writer for each result as they won't always line up
-		rows := c.formatResults(result, "\t")
-		for _, r := range rows {
-			csvw.Write(strings.Split(r, "\t"))
+func writeConfigToPath(tok, org, path, dir string) error {
+	p := &config.DefaultConfig
+	p.Token = tok
+	p.Org = org
+
+	_, err := config.NewLocalConfigSVC(path, dir).CreateConfig(*p)
+	return err
+}
+
+func checkSetup(host string, skipVerify bool) error {
+	s := &http.SetupService{
+		Addr:               host,
+		InsecureSkipVerify: skipVerify,
+	}
+
+	isOnboarding, err := s.IsOnboarding(context.Background())
+	if err != nil {
+		return err
+	}
+
+	if isOnboarding {
+		return fmt.Errorf("the instance at %q has not been setup. Please run `influx setup` before issuing any additional commands", host)
+	}
+
+	return nil
+}
+
+func checkSetupRunEMiddleware(f *globalFlags) cobraRunEMiddleware {
+	return func(fn cobraRunEFn) cobraRunEFn {
+		return func(cmd *cobra.Command, args []string) error {
+			err := fn(cmd, args)
+			if err == nil {
+				return nil
+			}
+
+			if setupErr := checkSetup(f.Host, f.skipVerify); setupErr != nil && influxdb.EUnauthorized != influxdb.ErrorCode(setupErr) {
+				cmd.OutOrStderr().Write([]byte(fmt.Sprintf("Error: %s\n", internal.ErrorFmt(err).Error())))
+				return internal.ErrorFmt(setupErr)
+			}
+
+			return internal.ErrorFmt(err)
 		}
-		csvw.Flush()
 	}
 }
 
-func (c *CommandLine) writeColumns(response *client.Response, w io.Writer) {
-	for _, result := range response.Results {
-		// Create a tabbed writer for each result a they won't always line up
-		w := new(tabwriter.Writer)
-		w.Init(os.Stdout, 0, 8, 1, '\t', 0)
-		csv := c.formatResults(result, "\t")
-		for _, r := range csv {
-			fmt.Fprintln(w, r)
-		}
-		w.Flush()
+// walk calls f for c and all of its children.
+func walk(c *cobra.Command, f func(*cobra.Command)) {
+	f(c)
+	for _, c := range c.Commands() {
+		walk(c, f)
 	}
 }
 
-// formatResults will behave differently if you are formatting for columns or csv
-func (c *CommandLine) formatResults(result client.Result, separator string) []string {
-	rows := []string{}
-	// Create a tabbed writer for each result a they won't always line up
-	for i, row := range result.Series {
-		// gather tags
-		tags := []string{}
-		for k, v := range row.Tags {
-			tags = append(tags, fmt.Sprintf("%s=%s", k, v))
-			sort.Strings(tags)
-		}
-
-		columnNames := []string{}
-
-		// Only put name/tags in a column if format is csv
-		if c.Format == "csv" {
-			if len(tags) > 0 {
-				columnNames = append([]string{"tags"}, columnNames...)
-			}
-
-			if row.Name != "" {
-				columnNames = append([]string{"name"}, columnNames...)
-			}
-		}
-
-		for _, column := range row.Columns {
-			columnNames = append(columnNames, column)
-		}
-
-		// Output a line separator if we have more than one set or results and format is column
-		if i > 0 && c.Format == "column" {
-			rows = append(rows, "")
-		}
-
-		// If we are column format, we break out the name/tag to seperate lines
-		if c.Format == "column" {
-			if row.Name != "" {
-				n := fmt.Sprintf("name: %s", row.Name)
-				rows = append(rows, n)
-				if len(tags) == 0 {
-					l := strings.Repeat("-", len(n))
-					rows = append(rows, l)
-				}
-			}
-			if len(tags) > 0 {
-				t := fmt.Sprintf("tags: %s", (strings.Join(tags, ", ")))
-				rows = append(rows, t)
-			}
-		}
-
-		rows = append(rows, strings.Join(columnNames, separator))
-
-		// if format is column, break tags to their own line/format
-		if c.Format == "column" && len(tags) > 0 {
-			lines := []string{}
-			for _, columnName := range columnNames {
-				lines = append(lines, strings.Repeat("-", len(columnName)))
-			}
-			rows = append(rows, strings.Join(lines, separator))
-		}
-
-		for _, v := range row.Values {
-			var values []string
-			if c.Format == "csv" {
-				if row.Name != "" {
-					values = append(values, row.Name)
-				}
-				if len(tags) > 0 {
-					values = append(values, strings.Join(tags, ","))
-				}
-			}
-
-			for _, vv := range v {
-				values = append(values, interfaceToString(vv))
-			}
-			rows = append(rows, strings.Join(values, separator))
-		}
-		// Outout a line separator if in column format
-		if c.Format == "column" {
-			rows = append(rows, "")
-		}
+func newLocalKVService() (*kv.Service, error) {
+	boltFile, err := fs.BoltFile()
+	if err != nil {
+		return nil, err
 	}
-	return rows
-}
 
-func interfaceToString(v interface{}) string {
-	switch t := v.(type) {
-	case nil:
-		return ""
-	case bool:
-		return fmt.Sprintf("%v", v)
-	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, uintptr:
-		return fmt.Sprintf("%d", t)
-	case float32, float64:
-		return fmt.Sprintf("%v", t)
-	default:
-		return fmt.Sprintf("%v", t)
+	store := bolt.NewKVStore(zap.NewNop(), boltFile)
+	if err := store.Open(context.Background()); err != nil {
+		return nil, err
 	}
+
+	return kv.NewService(zap.NewNop(), store), nil
 }
 
-func (c *CommandLine) Settings() {
-	w := new(tabwriter.Writer)
-	w.Init(os.Stdout, 0, 8, 1, '\t', 0)
-	if c.Port > 0 {
-		fmt.Fprintf(w, "Host\t%s:%d\n", c.Host, c.Port)
-	} else {
-		fmt.Fprintf(w, "Host\t%s\n", c.Host)
+type organization struct {
+	id, name string
+}
+
+func (o *organization) register(cmd *cobra.Command, persistent bool) {
+	opts := flagOpts{
+		{
+			DestP:      &o.id,
+			Flag:       "org-id",
+			Desc:       "The ID of the organization",
+			Persistent: persistent,
+		},
+		{
+			DestP:      &o.name,
+			Flag:       "org",
+			Short:      'o',
+			Desc:       "The name of the organization",
+			Persistent: persistent,
+		},
 	}
-	fmt.Fprintf(w, "Username\t%s\n", c.Username)
-	fmt.Fprintf(w, "Database\t%s\n", c.Database)
-	fmt.Fprintf(w, "Pretty\t%v\n", c.Pretty)
-	fmt.Fprintf(w, "Format\t%s\n", c.Format)
-	fmt.Fprintf(w, "Write Consistency\t%s\n", c.WriteConsistency)
-	fmt.Fprintln(w)
-	w.Flush()
+	opts.mustRegister(cmd)
 }
 
-func (c *CommandLine) help() {
-	fmt.Println(`Usage:
-        connect <host:port>   connect to another node
-        auth                  prompt for username and password
-        pretty                toggle pretty print
-        use <db_name>         set current databases
-        format <format>       set the output format: json, csv, or column
-        precision <format>    set the timestamp format: h,m,s,ms,u,ns
-        consistency <level>   set write consistency level: any, one, quorum, or all
-        settings              output the current settings for the shell
-        exit                  quit the influx shell
+func (o *organization) getID(orgSVC influxdb.OrganizationService) (influxdb.ID, error) {
+	if o.id != "" {
+		influxOrgID, err := influxdb.IDFromString(o.id)
+		if err != nil {
+			return 0, fmt.Errorf("invalid org ID provided: %s", err.Error())
+		}
+		return *influxOrgID, nil
+	}
 
-        show databases        show database names
-        show series           show series information
-        show measurements     show measurement information
-        show tag keys         show tag key information
-        show tag values       show tag value information
-
-        a full list of influxql commands can be found at:
-        https://influxdb.com/docs/v0.9/query_language/spec.html
-`)
+	getOrgByName := func(name string) (influxdb.ID, error) {
+		org, err := orgSVC.FindOrganization(context.Background(), influxdb.OrganizationFilter{
+			Name: &name,
+		})
+		if err != nil {
+			return 0, err
+		}
+		return org.ID, nil
+	}
+	if o.name != "" {
+		return getOrgByName(o.name)
+	}
+	// last check is for the org set in the CLI config. This will be last in priority.
+	if flags.Org != "" {
+		return getOrgByName(flags.Org)
+	}
+	return 0, fmt.Errorf("failed to locate organization criteria")
 }
 
-func (c *CommandLine) gopher() {
-	fmt.Println(`
-                                          .-::-::://:-::-    .:/++/'
-                                     '://:-''/oo+//++o+/.://o-    ./+:
-                                  .:-.    '++-         .o/ '+yydhy'  o-
-                               .:/.      .h:         :osoys  .smMN-  :/
-                            -/:.'        s-         /MMMymh.   '/y/  s'
-                         -+s:''''        d          -mMMms//     '-/o:
-                       -/++/++/////:.    o:          '... s-        :s.
-                     :+-+s-'       ':/'  's-             /+          'o:
-                   '+-'o:        /ydhsh.  '//.        '-o-             o-
-                  .y. o:        .MMMdm+y    ':+++:::/+:.'               s:
-                .-h/  y-        'sdmds'h -+ydds:::-.'                   'h.
-             .//-.d'  o:          '.' 'dsNMMMNh:.:++'                    :y
-            +y.  'd   's.            .s:mddds:     ++                     o/
-           'N-  odd    'o/.       './o-s-'   .---+++'                      o-
-           'N'  yNd      .://:/:::::. -s   -+/s/./s'                       'o/'
-            so'  .h         ''''       ////s: '+. .s                         +y'
-             os/-.y'                       's' 'y::+                          +d'
-               '.:o/                        -+:-:.'                            so.---.'
-                   o'                                                          'd-.''/s'
-                   .s'                                                          :y.''.y
-                    -s                                                           mo:::'
-                     ::                                                          yh
-                      //                                      ''''               /M'
-                       o+                                    .s///:/.            'N:
-                        :+                                   /:    -s'            ho
-                         's-                               -/s/:+/.+h'            +h
-                           ys'                            ':'    '-.              -d
-                            oh                                                    .h
-                             /o                                                   .s
-                              s.                                                  .h
-                              -y                                                  .d
-                               m/                                                 -h
-                               +d                                                 /o
-                               'N-                                                y:
-                                h:                                                m.
-                                s-                                               -d
-                                o-                                               s+
-                                +-                                              'm'
-                                s/                                              oo--.
-                                y-                                             /s  ':+'
-                                s'                                           'od--' .d:
-                                -+                                         ':o: ':+-/+
-                                 y-                                      .:+-      '
-                                //o-                                 '.:+/.
-                                .-:+/'                           ''-/+/.
-                                    ./:'                    ''.:o+/-'
-                                      .+o:/:/+-'      ''.-+ooo/-'
-                                         o:   -h///++////-.
-                                        /:   .o/
-                                       //+  'y
-                                       ./sooy.
+func (o *organization) validOrgFlags(f *globalFlags) error {
+	if o.id == "" && o.name == "" && f != nil {
+		o.name = f.Org
+	}
 
-`)
+	if o.id == "" && o.name == "" {
+		return fmt.Errorf("must specify org-id, or org name")
+	} else if o.id != "" && o.name != "" {
+		return fmt.Errorf("must specify org-id, or org name not both")
+	}
+	return nil
+}
+
+type flagOpts []cli.Opt
+
+func (f flagOpts) mustRegister(cmd *cobra.Command) {
+	for i := range f {
+		envVar := f[i].Flag
+		if e := f[i].EnvVar; e != "" {
+			envVar = e
+		}
+
+		f[i].Desc = fmt.Sprintf(
+			"%s; Maps to env var $INFLUX_%s",
+			f[i].Desc,
+			strings.ToUpper(strings.Replace(envVar, "-", "_", -1)),
+		)
+	}
+	cli.BindOptions(cmd, f)
+}
+
+func registerPrintOptions(cmd *cobra.Command, headersP, jsonOutP *bool) {
+	var opts flagOpts
+	if headersP != nil {
+		opts = append(opts, cli.Opt{
+			DestP:   headersP,
+			Flag:    "hide-headers",
+			EnvVar:  "HIDE_HEADERS",
+			Desc:    "Hide the table headers; defaults false",
+			Default: false,
+		})
+	}
+	if jsonOutP != nil {
+		opts = append(opts, cli.Opt{
+			DestP:   jsonOutP,
+			Flag:    "json",
+			EnvVar:  "OUTPUT_JSON",
+			Desc:    "Output data as json; defaults false",
+			Default: false,
+		})
+	}
+	opts.mustRegister(cmd)
+}
+
+func setViperOptions() {
+	viper.SetEnvPrefix("INFLUX")
+	viper.AutomaticEnv()
+	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
+}
+
+func writeJSON(w io.Writer, v interface{}) error {
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "\t")
+	return enc.Encode(v)
+}
+
+func newBucketService() (influxdb.BucketService, error) {
+	if flags.local {
+		return newLocalKVService()
+	}
+
+	client, err := newHTTPClient()
+	if err != nil {
+		return nil, err
+	}
+
+	return &http.BucketService{
+		Client: client,
+	}, nil
 }

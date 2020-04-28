@@ -1,219 +1,110 @@
-package main_test
+package main
 
 import (
-	"encoding/json"
-	"net/http"
-	"net/http/httptest"
-	"net/url"
+	"bytes"
+	"io/ioutil"
 	"testing"
 
-	"github.com/influxdb/influxdb/client"
-	main "github.com/influxdb/influxdb/cmd/influx"
+	"github.com/influxdata/influxdb/v2/cmd/influx/config"
+	"github.com/spf13/cobra"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func TestParseCommand_CommandsExist(t *testing.T) {
-	t.Parallel()
-	c := main.CommandLine{}
+func Test_influx_cmd(t *testing.T) {
 	tests := []struct {
-		cmd string
-	}{
-		{cmd: "gopher"},
-		{cmd: "connect"},
-		{cmd: "help"},
-		{cmd: "pretty"},
-		{cmd: "use"},
-		{cmd: ""}, // test that a blank command just returns
-	}
-	for _, test := range tests {
-		if !c.ParseCommand(test.cmd) {
-			t.Fatalf(`Command failed for %q.`, test.cmd)
-		}
-	}
-}
-
-func TestParseCommand_TogglePretty(t *testing.T) {
-	t.Parallel()
-	c := main.CommandLine{}
-	if c.Pretty {
-		t.Fatalf(`Pretty should be false.`)
-	}
-	c.ParseCommand("pretty")
-	if !c.Pretty {
-		t.Fatalf(`Pretty should be true.`)
-	}
-	c.ParseCommand("pretty")
-	if c.Pretty {
-		t.Fatalf(`Pretty should be false.`)
-	}
-}
-
-func TestParseCommand_Exit(t *testing.T) {
-	t.Parallel()
-	c := main.CommandLine{}
-	tests := []struct {
-		cmd string
-	}{
-		{cmd: "exit"},
-		{cmd: " exit"},
-		{cmd: "exit "},
-		{cmd: "Exit "},
-	}
-
-	for _, test := range tests {
-		if c.ParseCommand(test.cmd) {
-			t.Fatalf(`Command "exit" failed for %q.`, test.cmd)
-		}
-	}
-}
-
-func TestParseCommand_Use(t *testing.T) {
-	t.Parallel()
-	c := main.CommandLine{}
-	tests := []struct {
-		cmd string
-	}{
-		{cmd: "use db"},
-		{cmd: " use db"},
-		{cmd: "use db "},
-		{cmd: "use db;"},
-		{cmd: "use db; "},
-		{cmd: "Use db"},
-	}
-
-	for _, test := range tests {
-		if !c.ParseCommand(test.cmd) {
-			t.Fatalf(`Command "use" failed for %q.`, test.cmd)
-		}
-
-		if c.Database != "db" {
-			t.Fatalf(`Command "use" changed database to %q. Expected db`, c.Database)
-		}
-	}
-}
-
-func TestParseCommand_Consistency(t *testing.T) {
-	t.Parallel()
-	c := main.CommandLine{}
-	tests := []struct {
-		cmd string
-	}{
-		{cmd: "consistency one"},
-		{cmd: " consistency one"},
-		{cmd: "consistency one "},
-		{cmd: "consistency one;"},
-		{cmd: "consistency one; "},
-		{cmd: "Consistency one"},
-	}
-
-	for _, test := range tests {
-		if !c.ParseCommand(test.cmd) {
-			t.Fatalf(`Command "consistency" failed for %q.`, test.cmd)
-		}
-
-		if c.WriteConsistency != "one" {
-			t.Fatalf(`Command "consistency" changed consistency to %q. Expected one`, c.WriteConsistency)
-		}
-	}
-}
-
-func TestParseCommand_Insert(t *testing.T) {
-	t.Parallel()
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var data client.Response
-		w.WriteHeader(http.StatusNoContent)
-		_ = json.NewEncoder(w).Encode(data)
-	}))
-	defer ts.Close()
-
-	u, _ := url.Parse(ts.URL)
-	config := client.Config{URL: *u}
-	c, err := client.NewClient(config)
-	if err != nil {
-		t.Fatalf("unexpected error.  expected %v, actual %v", nil, err)
-	}
-	m := main.CommandLine{Client: c}
-
-	tests := []struct {
-		cmd string
-	}{
-		{cmd: "INSERT cpu,host=serverA,region=us-west value=1.0"},
-		{cmd: " INSERT cpu,host=serverA,region=us-west value=1.0"},
-		{cmd: "INSERT   cpu,host=serverA,region=us-west value=1.0"},
-		{cmd: "insert cpu,host=serverA,region=us-west    value=1.0    "},
-		{cmd: "insert"},
-		{cmd: "Insert "},
-		{cmd: "insert c"},
-		{cmd: "insert int"},
-	}
-
-	for _, test := range tests {
-		if !m.ParseCommand(test.cmd) {
-			t.Fatalf(`Command "insert" failed for %q.`, test.cmd)
-		}
-	}
-}
-
-func TestParseCommand_InsertInto(t *testing.T) {
-	t.Parallel()
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var data client.Response
-		w.WriteHeader(http.StatusNoContent)
-		_ = json.NewEncoder(w).Encode(data)
-	}))
-	defer ts.Close()
-
-	u, _ := url.Parse(ts.URL)
-	config := client.Config{URL: *u}
-	c, err := client.NewClient(config)
-	if err != nil {
-		t.Fatalf("unexpected error.  expected %v, actual %v", nil, err)
-	}
-	m := main.CommandLine{Client: c}
-
-	tests := []struct {
-		cmd, db, rp string
+		name     string
+		args     []string
+		envVars  map[string]string
+		expected globalFlags
 	}{
 		{
-			cmd: `INSERT INTO test cpu,host=serverA,region=us-west value=1.0`,
-			db:  "",
-			rp:  "test",
+			name:    "all full length flags set",
+			args:    []string{"--token=TOKEN", "--host=HOST", "--local=true", "--skip-verify=true"},
+			envVars: envVarsZeroMap,
+			expected: globalFlags{
+				Config: config.Config{
+					Token: "TOKEN",
+					Host:  "HOST",
+				},
+				skipVerify: true,
+				local:      true,
+			},
 		},
 		{
-			cmd: ` INSERT INTO .test cpu,host=serverA,region=us-west value=1.0`,
-			db:  "",
-			rp:  "test",
+			name:    "token p flag set",
+			args:    []string{"-t=TOKEN", "--host=HOST", "--local=true", "--skip-verify=true"},
+			envVars: envVarsZeroMap,
+			expected: globalFlags{
+				Config: config.Config{
+					Token: "TOKEN",
+					Host:  "HOST",
+				},
+				skipVerify: true,
+				local:      true,
+			},
 		},
 		{
-			cmd: `INSERT INTO   "test test" cpu,host=serverA,region=us-west value=1.0`,
-			db:  "",
-			rp:  "test test",
+			name: "env vars set",
+			args: []string{"--local=true", "--skip-verify=true"},
+			envVars: map[string]string{
+				"INFLUX_TOKEN": "TOKEN",
+				"INFLUX_HOST":  "HOST",
+			},
+			expected: globalFlags{
+				Config: config.Config{
+					Token: "TOKEN",
+					Host:  "HOST",
+				},
+				skipVerify: true,
+				local:      true,
+			},
 		},
 		{
-			cmd: `Insert iNTO test.test cpu,host=serverA,region=us-west value=1.0`,
-			db:  "test",
-			rp:  "test",
-		},
-		{
-			cmd: `insert into "test test" cpu,host=serverA,region=us-west value=1.0`,
-			db:  "test",
-			rp:  "test test",
-		},
-		{
-			cmd: `insert into "d b"."test test" cpu,host=serverA,region=us-west value=1.0`,
-			db:  "d b",
-			rp:  "test test",
+			name: "env vars and flags set",
+			args: []string{"--local=true", "--token=flag-token", "--host=flag-host"},
+			envVars: map[string]string{
+				"INFLUX_TOKEN": "TOKEN",
+				"INFLUX_HOST":  "HOST",
+			},
+			expected: globalFlags{
+				Config: config.Config{
+					Token: "flag-token",
+					Host:  "flag-host",
+				},
+				skipVerify: false,
+				local:      true,
+			},
 		},
 	}
 
-	for _, test := range tests {
-		if !m.ParseCommand(test.cmd) {
-			t.Fatalf(`Command "insert into" failed for %q.`, test.cmd)
+	for _, tt := range tests {
+		fn := func(t *testing.T) {
+			defer addEnvVars(t, tt.envVars)()
+
+			builder := newInfluxCmdBuilder(
+				in(new(bytes.Buffer)),
+				out(ioutil.Discard),
+				err(ioutil.Discard),
+				runEMiddlware(func(fn cobraRunEFn) cobraRunEFn { return fn }),
+			)
+
+			flagCapture := new(globalFlags)
+			influxCmd := builder.cmd(func(f *globalFlags, opt genericCLIOpts) *cobra.Command {
+				flagCapture = f
+				return &cobra.Command{Use: "foo"}
+			})
+
+			influxCmd.SetArgs(append([]string{"foo"}, tt.args...))
+
+			require.NoError(t, influxCmd.Execute())
+
+			assert.Equal(t, tt.expected.Host, flagCapture.Host)
+			assert.Equal(t, tt.expected.Token, flagCapture.Token)
+			assert.Equal(t, tt.expected.local, flagCapture.local)
+			assert.Equal(t, tt.expected.skipVerify, flagCapture.skipVerify)
 		}
-		if m.Database != test.db {
-			t.Fatalf(`Command "insert into" db parsing failed, expected: %q, actual: %q`, test.db, m.Database)
-		}
-		if m.RetentionPolicy != test.rp {
-			t.Fatalf(`Command "insert into" rp parsing failed, expected: %q, actual: %q`, test.rp, m.RetentionPolicy)
-		}
+
+		t.Run(tt.name, fn)
 	}
 }
