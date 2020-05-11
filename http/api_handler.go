@@ -8,6 +8,7 @@ import (
 	"github.com/influxdata/influxdb/v2/authorizer"
 	"github.com/influxdata/influxdb/v2/chronograf/server"
 	"github.com/influxdata/influxdb/v2/http/metric"
+	"github.com/influxdata/influxdb/v2/kit/feature"
 	"github.com/influxdata/influxdb/v2/kit/prom"
 	kithttp "github.com/influxdata/influxdb/v2/kit/transport/http"
 	"github.com/influxdata/influxdb/v2/query"
@@ -50,6 +51,8 @@ type APIBackend struct {
 	WriteEventRecorder metric.EventRecorder
 	QueryEventRecorder metric.EventRecorder
 
+	AlgoWProxy FeatureProxyHandler
+
 	PointsWriter                    storage.PointsWriter
 	DeleteService                   influxdb.DeleteService
 	BackupService                   influxdb.BackupService
@@ -82,6 +85,8 @@ type APIBackend struct {
 	DocumentService                 influxdb.DocumentService
 	NotificationRuleStore           influxdb.NotificationRuleStore
 	NotificationEndpointService     influxdb.NotificationEndpointService
+	Flagger                         feature.Flagger
+	FlagsHandler                    http.Handler
 }
 
 // PrometheusCollectors exposes the prometheus collectors associated with an APIBackend.
@@ -121,10 +126,6 @@ func NewAPIHandler(b *APIBackend, opts ...APIHandlerOptFn) *APIHandler {
 	b.LabelService = authorizer.NewLabelServiceWithOrg(b.LabelService, b.OrgLookupService)
 
 	h.Mount("/api/v2", serveLinksHandler(b.HTTPErrorHandler))
-
-	authorizationBackend := NewAuthorizationBackend(b.Logger.With(zap.String("handler", "authorization")), b)
-	authorizationBackend.AuthorizationService = authorizer.NewAuthorizationService(b.AuthorizationService)
-	h.Mount(prefixAuthorization, NewAuthorizationHandler(b.Logger, authorizationBackend))
 
 	bucketBackend := NewBucketBackend(b.Logger.With(zap.String("handler", "bucket")), b)
 	bucketBackend.BucketService = authorizer.NewBucketService(b.BucketService, noAuthUserResourceMappingService)
@@ -203,6 +204,7 @@ func NewAPIHandler(b *APIBackend, opts ...APIHandlerOptFn) *APIHandler {
 	userHandler := NewUserHandler(b.Logger, userBackend)
 	h.Mount(prefixMe, userHandler)
 	h.Mount(prefixUsers, userHandler)
+	h.Mount("/api/v2/flags", b.FlagsHandler)
 
 	variableBackend := NewVariableBackend(b.Logger.With(zap.String("handler", "variable")), b)
 	variableBackend.VariableService = authorizer.NewVariableService(b.VariableService)
@@ -236,6 +238,7 @@ var apiLinks = map[string]interface{}{
 	"external": map[string]string{
 		"statusFeed": "https://www.influxdata.com/feed/json",
 	},
+	"flags":                 "/api/v2/flags",
 	"labels":                "/api/v2/labels",
 	"variables":             "/api/v2/variables",
 	"me":                    "/api/v2/me",

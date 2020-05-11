@@ -1,8 +1,27 @@
-## v2.0.0-beta.10 [Unreleased]
+## v2.0.0-beta.11 [unreleased]
 
 ### Features
 
+1. [18011](https://github.com/influxdata/influxdb/pull/18011): Integrate UTC dropdown when making custom time range query
+
 ### Bug Fixes
+
+### UI Improvements
+
+## v2.0.0-beta.10 [2020-05-07]
+
+### Features
+
+1. [17934](https://github.com/influxdata/influxdb/pull/17934): Add ability to delete a stack and all the resources associated with it
+1. [17941](https://github.com/influxdata/influxdb/pull/17941): Enforce DNS name compliance on all pkger resources' metadata.name field
+1. [17989](https://github.com/influxdata/influxdb/pull/17989): Add stateful pkg management with stacks
+1. [18007](https://github.com/influxdata/influxdb/pull/18007): Add remove and list pkger stack commands to influx CLI
+1. [18017](https://github.com/influxdata/influxdb/pull/18017): Fixup display message for interactive influx setup cmd
+
+### Bug Fixes
+
+1. [17906](https://github.com/influxdata/influxdb/pull/17906): Ensure UpdateUser cleans up the index when updating names
+1. [17933](https://github.com/influxdata/influxdb/pull/17933): Ensure Checks can be set for zero values
 
 ### UI Improvements
 
@@ -11,6 +30,8 @@
 ## v2.0.0-beta.9 [2020-04-23]
 
 ### Features
+
+1. [17851](https://github.com/influxdata/influxdb/pull/17851): Add feature flag package capability and flags endpoint
 
 ### Bug Fixes
 
@@ -23,6 +44,7 @@
 1. [17714](https://github.com/influxdata/influxdb/pull/17714): Cloud environments no longer render markdown images, for security reasons.
 1. [17321](https://github.com/influxdata/influxdb/pull/17321): Improve UI for sorting resources
 1. [17740](https://github.com/influxdata/influxdb/pull/17740): Add single-color color schemes for visualizations
+1. [17849](https://github.com/influxdata/influxdb/pull/17849): Move Organization navigation items to user menu.
 
 ## v2.0.0-beta.8 [2020-04-10]
 

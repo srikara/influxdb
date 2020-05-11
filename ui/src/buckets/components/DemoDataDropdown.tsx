@@ -1,36 +1,98 @@
 // Libraries
-import React, {FC} from 'react'
-import _ from 'lodash'
+import React, {FC, useEffect} from 'react'
+import {connect} from 'react-redux'
+import {get, sortBy} from 'lodash'
+
+// Actions
+import {
+  getDemoDataBucketMembership as getDemoDataBucketMembershipAction,
+  getDemoDataBuckets as getDemoDataBucketsAction,
+} from 'src/cloud/actions/demodata'
 
 // Components
-import {IconFont, ComponentColor, Dropdown} from '@influxdata/clockface'
+import {ComponentColor, Dropdown, Icon, IconFont} from '@influxdata/clockface'
 
 // Types
-import {Bucket} from 'src/types'
-import {getDemoDataBucketMembership} from 'src/cloud/actions/demodata'
+import {AppState, Bucket, ResourceType} from 'src/types'
 
-interface Props {
-  buckets: Bucket[]
-  getMembership: typeof getDemoDataBucketMembership
+interface StateProps {
+  ownBucketsByID: {[id: string]: Bucket}
+  demoDataBuckets: Bucket[]
 }
 
-const DemoDataDropdown: FC<Props> = ({buckets, getMembership}) => {
-  const demoDataItems = buckets.map(b => (
-    <Dropdown.Item
-      testID={`dropdown-item--demodata-${b.name}`}
-      id={b.id}
-      key={b.id}
-      value={b}
-      onClick={getMembership}
-    >
-      {b.name}
-    </Dropdown.Item>
-  ))
+interface DispatchProps {
+  getDemoDataBucketMembership: typeof getDemoDataBucketMembershipAction
+  getDemoDataBuckets: typeof getDemoDataBucketsAction
+}
+
+type Props = DispatchProps & StateProps
+
+const DemoDataDropdown: FC<Props> = ({
+  ownBucketsByID,
+  demoDataBuckets,
+  getDemoDataBucketMembership,
+  getDemoDataBuckets,
+}) => {
+  useEffect(() => {
+    getDemoDataBuckets()
+  }, [])
+
+  if (!demoDataBuckets.length) {
+    return null
+  }
+
+  const sortedBuckets = sortBy(demoDataBuckets, d => {
+    return d.name.toLocaleLowerCase()
+  })
+
+  const dropdownItems = sortedBuckets.map(b => {
+    if (ownBucketsByID[b.id]) {
+      return (
+        <Dropdown.Item
+          testID={`dropdown-item--demodata-${b.name}`}
+          className="demodata-dropdown--item__added"
+          id={b.id}
+          key={b.id}
+          value={b}
+          selected={true}
+        >
+          <div className="demodata-dropdown--item-contents">
+            <Icon
+              glyph={IconFont.Checkmark}
+              className="demodata-dropdown--item-icon"
+            />
+            {b.name}
+          </div>
+        </Dropdown.Item>
+      )
+    }
+
+    return (
+      <Dropdown.Item
+        testID={`dropdown-item--demodata-${b.name}`}
+        className="demodata-dropdown--item"
+        id={b.id}
+        key={b.id}
+        value={b}
+        onClick={getDemoDataBucketMembership}
+        selected={false}
+      >
+        <div className="demodata-dropdown--item-contents">
+          <Icon
+            glyph={IconFont.Checkmark}
+            className="demodata-dropdown--item-icon"
+          />
+          {b.name}
+        </div>
+      </Dropdown.Item>
+    )
+  })
 
   return (
     <Dropdown
       testID="dropdown--demodata"
-      style={{width: '200px', marginRight: '8px'}}
+      style={{width: '220px'}}
+      className="demodata-dropdown"
       button={(active, onClick) => (
         <Dropdown.Button
           active={active}
@@ -43,10 +105,23 @@ const DemoDataDropdown: FC<Props> = ({buckets, getMembership}) => {
         </Dropdown.Button>
       )}
       menu={onCollapse => (
-        <Dropdown.Menu onCollapse={onCollapse}>{demoDataItems}</Dropdown.Menu>
+        <Dropdown.Menu onCollapse={onCollapse}>{dropdownItems}</Dropdown.Menu>
       )}
     />
   )
 }
 
-export default DemoDataDropdown
+const mstp = (state: AppState): StateProps => ({
+  ownBucketsByID: state.resources[ResourceType.Buckets].byID,
+  demoDataBuckets: get(state, 'cloud.demoData.buckets', []) as Bucket[],
+})
+
+const mdtp: DispatchProps = {
+  getDemoDataBucketMembership: getDemoDataBucketMembershipAction,
+  getDemoDataBuckets: getDemoDataBucketsAction,
+}
+
+export default connect<StateProps, DispatchProps, {}>(
+  mstp,
+  mdtp
+)(DemoDataDropdown)

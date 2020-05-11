@@ -1016,10 +1016,10 @@
   resolved "https://registry.yarnpkg.com/@influxdata/clockface/-/clockface-2.1.0.tgz#786100fffc9794213ce68eb5fd994505c8c980ad"
   integrity sha512-ks7wtiNeJWB6LeFFw/aAOHc3sulmjDR/Ys0+IeLHRDrybdmlt3PZJJEIVYpNNZq5t7jSvO/y2oOBW7BPc1rKjg==
 
-"@influxdata/flux-lsp-browser@^0.5.2":
-  version "0.5.2"
-  resolved "https://registry.yarnpkg.com/@influxdata/flux-lsp-browser/-/flux-lsp-browser-0.5.2.tgz#0d1318ca1b1d2fc07e3f64b6dea4ee98c2db2c94"
-  integrity sha512-zXnUQKUAHqDowaxjANAKC3CJAOuNVxReWHU2EQThtVwjmdRQeMGznN1H8Wi7AcVM8VFrq1XyvYa3bUd7OFHV0g==
+"@influxdata/flux-lsp-browser@^0.5.6":
+  version "0.5.6"
+  resolved "https://registry.yarnpkg.com/@influxdata/flux-lsp-browser/-/flux-lsp-browser-0.5.6.tgz#ca0d57c713ca4bbca4828b9c26b86c3ec4781249"
+  integrity sha512-9NP4zl2nLNy4C9lyGfqf09C41w1ENINXg1X5O+LZFgqbc2oRF3HyZFgDbUfPRgsWUAQrjahSNm29bt/KnOgy2w==
 
 "@influxdata/flux-parser@^0.3.0":
   version "0.3.0"
@@ -11659,10 +11659,10 @@ typedarray@^0.0.6:
   resolved "https://registry.yarnpkg.com/typedarray/-/typedarray-0.0.6.tgz#867ac74e3864187b1d3d47d996a78ec5c8830777"
   integrity sha1-hnrHTjhkGHsdPUfZlqeOxciDB3c=
 
-typescript@3.6.4:
-  version "3.6.4"
-  resolved "https://registry.yarnpkg.com/typescript/-/typescript-3.6.4.tgz#b18752bb3792bc1a0281335f7f6ebf1bbfc5b91d"
-  integrity sha512-unoCll1+l+YK4i4F8f22TaNVPRHcD9PA3yCuZ8g5e0qGqlVlJ/8FSateOLLSagn+Yg5+ZwuPkL8LFUc0Jcvksg==
+typescript@3.8.3:
+  version "3.8.3"
+  resolved "https://registry.yarnpkg.com/typescript/-/typescript-3.8.3.tgz#409eb8544ea0335711205869ec458ab109ee1061"
+  integrity sha512-MYlEfn5VrLNsgudQTVJeNaQFUAI7DkhnOjdpAp4T+ku1TfQClewlbSuTVHiA+8skNBgaf02TL/kLOvig4y3G8w==
 
 ua-parser-js@^0.7.18:
   version "0.7.18"

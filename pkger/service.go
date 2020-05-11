@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"path"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/influxdata/influxdb/v2"
 	ierrors "github.com/influxdata/influxdb/v2/kit/errors"
+	icheck "github.com/influxdata/influxdb/v2/notification/check"
 	"github.com/influxdata/influxdb/v2/notification/rule"
 	"github.com/influxdata/influxdb/v2/snowflake"
 	"github.com/influxdata/influxdb/v2/task/options"
@@ -58,6 +60,9 @@ const ResourceTypeStack influxdb.ResourceType = "stack"
 // SVC is the packages service interface.
 type SVC interface {
 	InitStack(ctx context.Context, userID influxdb.ID, stack Stack) (Stack, error)
+	DeleteStack(ctx context.Context, identifiers struct{ OrgID, UserID, StackID influxdb.ID }) error
+	ListStacks(ctx context.Context, orgID influxdb.ID, filter ListFilter) ([]Stack, error)
+
 	CreatePkg(ctx context.Context, setters ...CreatePkgSetFn) (*Pkg, error)
 	DryRun(ctx context.Context, orgID, userID influxdb.ID, pkg *Pkg, opts ...ApplyOptFn) (Summary, Diff, error)
 	Apply(ctx context.Context, orgID, userID influxdb.ID, pkg *Pkg, opts ...ApplyOptFn) (Summary, Diff, error)
@@ -198,6 +203,7 @@ func WithVariableSVC(varSVC influxdb.VariableService) ServiceSetterFn {
 // Store is the storage behavior the Service depends on.
 type Store interface {
 	CreateStack(ctx context.Context, stack Stack) error
+	ListStacks(ctx context.Context, orgID influxdb.ID, filter ListFilter) ([]Stack, error)
 	ReadStackByID(ctx context.Context, id influxdb.ID) (Stack, error)
 	UpdateStack(ctx context.Context, stack Stack) error
 	DeleteStack(ctx context.Context, id influxdb.ID) error
@@ -292,6 +298,50 @@ func (s *Service) InitStack(ctx context.Context, userID influxdb.ID, stack Stack
 	}
 
 	return stack, nil
+}
+
+// DeleteStack removes a stack and all the resources that have are associated with the stack.
+func (s *Service) DeleteStack(ctx context.Context, identifiers struct{ OrgID, UserID, StackID influxdb.ID }) (e error) {
+	stack, err := s.store.ReadStackByID(ctx, identifiers.StackID)
+	if influxdb.ErrorCode(err) == influxdb.ENotFound {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if stack.OrgID != identifiers.OrgID {
+		return &influxdb.Error{
+			Code: influxdb.EConflict,
+			Msg:  "you do not have access to given stack ID",
+		}
+	}
+
+	// providing empty Pkg will remove all applied resources
+	state, err := s.dryRun(ctx, identifiers.OrgID, new(Pkg), applyOptFromOptFns(ApplyWithStackID(identifiers.StackID)))
+	if err != nil {
+		return err
+	}
+
+	coordinator := &rollbackCoordinator{sem: make(chan struct{}, s.applyReqLimit)}
+	defer coordinator.rollback(s.log, &e, identifiers.OrgID)
+
+	err = s.applyState(ctx, coordinator, identifiers.OrgID, identifiers.UserID, state, nil)
+	if err != nil {
+		return err
+	}
+
+	return s.store.DeleteStack(ctx, identifiers.StackID)
+}
+
+// ListFilter are filter options for filtering stacks from being returned.
+type ListFilter struct {
+	StackIDs []influxdb.ID
+	Names    []string
+}
+
+// ListStacks returns a list of stacks.
+func (s *Service) ListStacks(ctx context.Context, orgID influxdb.ID, f ListFilter) ([]Stack, error) {
+	return s.store.ListStacks(ctx, orgID, f)
 }
 
 type (
@@ -644,28 +694,37 @@ func (s *Service) filterOrgResourceKinds(resourceKindFilters []Kind) []struct {
 // for later calls to Apply. This func will be run on an Apply if it has not been run
 // already.
 func (s *Service) DryRun(ctx context.Context, orgID, userID influxdb.ID, pkg *Pkg, opts ...ApplyOptFn) (Summary, Diff, error) {
-	state, err := s.dryRun(ctx, orgID, pkg, opts...)
+	opt := applyOptFromOptFns(opts...)
+
+	if opt.StackID != 0 {
+		remotePkgs, err := s.getStackRemotePackages(ctx, opt.StackID)
+		if err != nil {
+			return Summary{}, Diff{}, err
+		}
+		pkg, err = Combine(append(remotePkgs, pkg), ValidWithoutResources())
+		if err != nil {
+			return Summary{}, Diff{}, err
+		}
+	}
+
+	state, err := s.dryRun(ctx, orgID, pkg, opt)
 	if err != nil {
 		return Summary{}, Diff{}, err
 	}
 	return newSummaryFromStatePkg(state, pkg), state.diff(), nil
 }
 
-func (s *Service) dryRun(ctx context.Context, orgID influxdb.ID, pkg *Pkg, opts ...ApplyOptFn) (*stateCoordinator, error) {
+func (s *Service) dryRun(ctx context.Context, orgID influxdb.ID, pkg *Pkg, opt ApplyOpt) (*stateCoordinator, error) {
 	// so here's the deal, when we have issues with the parsing validation, we
 	// continue to do the diff anyhow. any resource that does not have a name
 	// will be skipped, and won't bleed into the dry run here. We can now return
 	// a error (parseErr) and valid diff/summary.
 	var parseErr error
-	if !pkg.isParsed {
-		err := pkg.Validate()
-		if err != nil && !IsParseErr(err) {
-			return nil, internalErr(err)
-		}
-		parseErr = err
+	err := pkg.Validate(ValidWithoutResources())
+	if err != nil && !IsParseErr(err) {
+		return nil, internalErr(err)
 	}
-
-	opt := applyOptFromOptFns(opts...)
+	parseErr = err
 
 	if len(opt.EnvRefs) > 0 {
 		err := pkg.applyEnvRefs(opt.EnvRefs)
@@ -694,7 +753,8 @@ func (s *Service) dryRun(ctx context.Context, orgID influxdb.ID, pkg *Pkg, opts 
 	s.dryRunTasks(ctx, orgID, state.mTasks)
 	s.dryRunTelegrafConfigs(ctx, orgID, state.mTelegrafs)
 	s.dryRunVariables(ctx, orgID, state.mVariables)
-	err := s.dryRunNotificationEndpoints(ctx, orgID, state.mEndpoints)
+
+	err = s.dryRunNotificationEndpoints(ctx, orgID, state.mEndpoints)
 	if err != nil {
 		return nil, ierrors.Wrap(err, "failed to dry run notification endpoints")
 	}
@@ -898,11 +958,9 @@ func (s *Service) dryRunVariables(ctx context.Context, orgID influxdb.ID, vars m
 	}
 
 	for _, v := range vars {
-		var existing *influxdb.Variable
+		existing := mNames[v.parserVar.Name()]
 		if v.ID() != 0 {
 			existing = mIDs[v.ID()]
-		} else {
-			existing = mNames[v.parserVar.Name()]
 		}
 		if IsNew(v.stateStatus) && existing != nil {
 			v.stateStatus = StateStatusExists
@@ -1036,8 +1094,9 @@ func (s *Service) dryRunResourceLabelMapping(ctx context.Context, state *stateCo
 		ResourceID:   ident.id,
 		ResourceType: ident.resourceType,
 	})
-	if err != nil {
-		return nil, err
+	if err != nil && influxdb.ErrorCode(err) != influxdb.ENotFound {
+		msgFmt := fmt.Sprintf("failed to find labels mappings for %s resource[%q]", ident.resourceType, ident.id)
+		return nil, ierrors.Wrap(err, msgFmt)
 	}
 
 	pkgLabels := labelSlcToMap(pkgResourceLabels)
@@ -1069,7 +1128,7 @@ func (s *Service) dryRunResourceLabelMapping(ctx context.Context, state *stateCo
 func (s *Service) addStackState(ctx context.Context, stackID influxdb.ID, state *stateCoordinator) error {
 	stack, err := s.store.ReadStackByID(ctx, stackID)
 	if err != nil {
-		return ierrors.Wrap(internalErr(err), "reading stack")
+		return ierrors.Wrap(err, "reading stack")
 	}
 
 	state.addStackState(stack)
@@ -1119,19 +1178,29 @@ func applyOptFromOptFns(opts ...ApplyOptFn) ApplyOpt {
 // in its entirety. If a failure happens midway then the entire pkg will be rolled back to the state
 // from before the pkg were applied.
 func (s *Service) Apply(ctx context.Context, orgID, userID influxdb.ID, pkg *Pkg, opts ...ApplyOptFn) (sum Summary, diff Diff, e error) {
-	if !pkg.isParsed {
-		if err := pkg.Validate(); err != nil {
-			return Summary{}, Diff{}, failedValidationErr(err)
+	opt := applyOptFromOptFns(opts...)
+
+	if opt.StackID != 0 {
+		remotePkgs, err := s.getStackRemotePackages(ctx, opt.StackID)
+		if err != nil {
+			return Summary{}, Diff{}, err
+		}
+
+		pkg, err = Combine(append(remotePkgs, pkg), ValidWithoutResources())
+		if err != nil {
+			return Summary{}, Diff{}, err
 		}
 	}
 
-	opt := applyOptFromOptFns(opts...)
+	if err := pkg.Validate(ValidWithoutResources()); err != nil {
+		return Summary{}, Diff{}, failedValidationErr(err)
+	}
 
 	if err := pkg.applyEnvRefs(opt.EnvRefs); err != nil {
 		return Summary{}, Diff{}, failedValidationErr(err)
 	}
 
-	state, err := s.dryRun(ctx, orgID, pkg, opts...)
+	state, err := s.dryRun(ctx, orgID, pkg, opt)
 	if err != nil {
 		return Summary{}, Diff{}, err
 	}
@@ -1166,7 +1235,7 @@ func (s *Service) Apply(ctx context.Context, orgID, userID influxdb.ID, pkg *Pkg
 func (s *Service) applyState(ctx context.Context, coordinator *rollbackCoordinator, orgID, userID influxdb.ID, state *stateCoordinator, missingSecrets map[string]string) (e error) {
 	endpointApp, ruleApp, err := s.applyNotificationGenerator(ctx, userID, state.rules(), state.endpoints())
 	if err != nil {
-		return err
+		return ierrors.Wrap(err, "failed to setup notification generator")
 	}
 
 	// each grouping here runs for its entirety, then returns an error that
@@ -1271,15 +1340,18 @@ func (s *Service) applyBuckets(ctx context.Context, buckets []*stateBucket) appl
 
 func (s *Service) rollbackBuckets(ctx context.Context, buckets []*stateBucket) error {
 	rollbackFn := func(b *stateBucket) error {
+		if !IsNew(b.stateStatus) && b.existing == nil {
+			return nil
+		}
+
 		var err error
-		switch b.stateStatus {
-		case StateStatusRemove:
+		switch {
+		case IsRemoval(b.stateStatus):
 			err = ierrors.Wrap(s.bucketSVC.CreateBucket(ctx, b.existing), "rolling back removed bucket")
-		case StateStatusExists:
-			rp := b.parserBkt.RetentionRules.RP()
+		case IsExisting(b.stateStatus):
 			_, err = s.bucketSVC.UpdateBucket(ctx, b.ID(), influxdb.BucketUpdate{
-				Description:     &b.parserBkt.Description,
-				RetentionPeriod: &rp,
+				Description:     &b.existing.Description,
+				RetentionPeriod: &b.existing.RetentionPeriod,
 			})
 			err = ierrors.Wrap(err, "rolling back existing bucket to previous state")
 		default:
@@ -1304,13 +1376,16 @@ func (s *Service) rollbackBuckets(ctx context.Context, buckets []*stateBucket) e
 }
 
 func (s *Service) applyBucket(ctx context.Context, b *stateBucket) (influxdb.Bucket, error) {
-	switch b.stateStatus {
-	case StateStatusRemove:
+	switch {
+	case IsRemoval(b.stateStatus):
 		if err := s.bucketSVC.DeleteBucket(ctx, b.ID()); err != nil {
+			if influxdb.ErrorCode(err) == influxdb.ENotFound {
+				return influxdb.Bucket{}, nil
+			}
 			return influxdb.Bucket{}, fmt.Errorf("failed to delete bucket[%q]: %w", b.ID(), err)
 		}
 		return *b.existing, nil
-	case StateStatusExists:
+	case IsExisting(b.stateStatus) && b.existing != nil:
 		rp := b.parserBkt.RetentionRules.RP()
 		newName := b.parserBkt.Name()
 		influxBucket, err := s.bucketSVC.UpdateBucket(ctx, b.ID(), influxdb.BucketUpdate{
@@ -1354,7 +1429,7 @@ func (s *Service) applyChecks(ctx context.Context, checks []*stateCheck) applier
 		influxCheck, err := s.applyCheck(ctx, c, userID)
 		if err != nil {
 			return &applyErrBody{
-				name: c.parserCheck.Name(),
+				name: c.parserCheck.PkgName(),
 				msg:  err.Error(),
 			}
 		}
@@ -1382,8 +1457,8 @@ func (s *Service) applyChecks(ctx context.Context, checks []*stateCheck) applier
 func (s *Service) rollbackChecks(ctx context.Context, checks []*stateCheck) error {
 	rollbackFn := func(c *stateCheck) error {
 		var err error
-		switch c.stateStatus {
-		case StateStatusRemove:
+		switch {
+		case IsRemoval(c.stateStatus):
 			err = s.checkSVC.CreateCheck(
 				ctx,
 				influxdb.CheckCreate{
@@ -1393,13 +1468,16 @@ func (s *Service) rollbackChecks(ctx context.Context, checks []*stateCheck) erro
 				c.existing.GetOwnerID(),
 			)
 			c.id = c.existing.GetID()
-		case StateStatusNew:
-			err = s.checkSVC.DeleteCheck(ctx, c.ID())
-		default:
+		case IsExisting(c.stateStatus):
+			if c.existing == nil {
+				return nil
+			}
 			_, err = s.checkSVC.UpdateCheck(ctx, c.ID(), influxdb.CheckCreate{
 				Check:  c.summarize().Check,
 				Status: influxdb.Status(c.parserCheck.status),
 			})
+		default:
+			err = s.checkSVC.DeleteCheck(ctx, c.ID())
 		}
 		return err
 	}
@@ -1419,13 +1497,16 @@ func (s *Service) rollbackChecks(ctx context.Context, checks []*stateCheck) erro
 }
 
 func (s *Service) applyCheck(ctx context.Context, c *stateCheck, userID influxdb.ID) (influxdb.Check, error) {
-	switch c.stateStatus {
-	case StateStatusRemove:
+	switch {
+	case IsRemoval(c.stateStatus):
 		if err := s.checkSVC.DeleteCheck(ctx, c.ID()); err != nil {
+			if influxdb.ErrorCode(err) == influxdb.ENotFound {
+				return &icheck.Threshold{Base: icheck.Base{ID: c.ID()}}, nil
+			}
 			return nil, fmt.Errorf("failed to delete check[%q]: %w", c.ID(), err)
 		}
 		return c.existing, nil
-	case StateStatusExists:
+	case IsExisting(c.stateStatus) && c.existing != nil:
 		influxCheck, err := s.checkSVC.UpdateCheck(ctx, c.ID(), influxdb.CheckCreate{
 			Check:  c.summarize().Check,
 			Status: c.parserCheck.Status(),
@@ -1463,7 +1544,7 @@ func (s *Service) applyDashboards(ctx context.Context, dashboards []*stateDashbo
 		influxBucket, err := s.applyDashboard(ctx, d)
 		if err != nil {
 			return &applyErrBody{
-				name: d.parserDash.Name(),
+				name: d.parserDash.PkgName(),
 				msg:  err.Error(),
 			}
 		}
@@ -1490,13 +1571,16 @@ func (s *Service) applyDashboards(ctx context.Context, dashboards []*stateDashbo
 }
 
 func (s *Service) applyDashboard(ctx context.Context, d *stateDashboard) (influxdb.Dashboard, error) {
-	switch d.stateStatus {
-	case StateStatusRemove:
+	switch {
+	case IsRemoval(d.stateStatus):
 		if err := s.dashSVC.DeleteDashboard(ctx, d.ID()); err != nil {
+			if influxdb.ErrorCode(err) == influxdb.ENotFound {
+				return influxdb.Dashboard{}, nil
+			}
 			return influxdb.Dashboard{}, fmt.Errorf("failed to delete dashboard[%q]: %w", d.ID(), err)
 		}
 		return *d.existing, nil
-	case StateStatusExists:
+	case IsExisting(d.stateStatus) && d.existing != nil:
 		name := d.parserDash.Name()
 		cells := convertChartsToCells(d.parserDash.Charts)
 		dash, err := s.dashSVC.UpdateDashboard(ctx, d.ID(), influxdb.DashboardUpdate{
@@ -1526,11 +1610,15 @@ func (s *Service) applyDashboard(ctx context.Context, d *stateDashboard) (influx
 
 func (s *Service) rollbackDashboards(ctx context.Context, dashs []*stateDashboard) error {
 	rollbackFn := func(d *stateDashboard) error {
+		if !IsNew(d.stateStatus) && d.existing == nil {
+			return nil
+		}
+
 		var err error
-		switch d.stateStatus {
-		case StateStatusRemove:
+		switch {
+		case IsRemoval(d.stateStatus):
 			err = ierrors.Wrap(s.dashSVC.CreateDashboard(ctx, d.existing), "rolling back removed dashboard")
-		case StateStatusExists:
+		case IsExisting(d.stateStatus):
 			_, err := s.dashSVC.UpdateDashboard(ctx, d.ID(), influxdb.DashboardUpdate{
 				Name:        &d.existing.Name,
 				Description: &d.existing.Description,
@@ -1624,11 +1712,15 @@ func (s *Service) applyLabels(ctx context.Context, labels []*stateLabel) applier
 
 func (s *Service) rollbackLabels(ctx context.Context, labels []*stateLabel) error {
 	rollbackFn := func(l *stateLabel) error {
+		if !IsNew(l.stateStatus) && l.existing == nil {
+			return nil
+		}
+
 		var err error
-		switch l.stateStatus {
-		case StateStatusRemove:
+		switch {
+		case IsRemoval(l.stateStatus):
 			err = s.labelSVC.CreateLabel(ctx, l.existing)
-		case StateStatusExists:
+		case IsExisting(l.stateStatus):
 			_, err = s.labelSVC.UpdateLabel(ctx, l.ID(), influxdb.LabelUpdate{
 				Name:       l.parserLabel.Name(),
 				Properties: l.existing.Properties,
@@ -1658,10 +1750,10 @@ func (s *Service) applyLabel(ctx context.Context, l *stateLabel) (influxdb.Label
 		influxLabel *influxdb.Label
 		err         error
 	)
-	switch l.stateStatus {
-	case StateStatusRemove:
+	switch {
+	case IsRemoval(l.stateStatus):
 		influxLabel, err = l.existing, s.labelSVC.DeleteLabel(ctx, l.ID())
-	case StateStatusExists:
+	case IsExisting(l.stateStatus) && l.existing != nil:
 		influxLabel, err = s.labelSVC.UpdateLabel(ctx, l.ID(), influxdb.LabelUpdate{
 			Name:       l.parserLabel.Name(),
 			Properties: l.properties(),
@@ -1671,6 +1763,9 @@ func (s *Service) applyLabel(ctx context.Context, l *stateLabel) (influxdb.Label
 		creatLabel := l.toInfluxLabel()
 		influxLabel = &creatLabel
 		err = ierrors.Wrap(s.labelSVC.CreateLabel(ctx, &creatLabel), "creating")
+	}
+	if influxdb.ErrorCode(err) == influxdb.ENotFound {
+		return influxdb.Label{}, nil
 	}
 	if err != nil || influxLabel == nil {
 		return influxdb.Label{}, err
@@ -1693,35 +1788,37 @@ func (s *Service) applyNotificationEndpoints(ctx context.Context, userID influxd
 		influxEndpoint, err := s.applyNotificationEndpoint(ctx, endpoint, userID)
 		if err != nil {
 			return &applyErrBody{
-				name: endpoint.parserEndpoint.Name(),
+				name: endpoint.parserEndpoint.PkgName(),
 				msg:  err.Error(),
 			}
 		}
 
 		mutex.Do(func() {
-			endpoints[i].id = influxEndpoint.GetID()
-			for _, secret := range influxEndpoint.SecretFields() {
-				switch {
-				case strings.HasSuffix(secret.Key, "-routing-key"):
-					if endpoints[i].parserEndpoint.routingKey == nil {
-						endpoints[i].parserEndpoint.routingKey = new(references)
+			if influxEndpoint != nil {
+				endpoints[i].id = influxEndpoint.GetID()
+				for _, secret := range influxEndpoint.SecretFields() {
+					switch {
+					case strings.HasSuffix(secret.Key, "-routing-key"):
+						if endpoints[i].parserEndpoint.routingKey == nil {
+							endpoints[i].parserEndpoint.routingKey = new(references)
+						}
+						endpoints[i].parserEndpoint.routingKey.Secret = secret.Key
+					case strings.HasSuffix(secret.Key, "-token"):
+						if endpoints[i].parserEndpoint.token == nil {
+							endpoints[i].parserEndpoint.token = new(references)
+						}
+						endpoints[i].parserEndpoint.token.Secret = secret.Key
+					case strings.HasSuffix(secret.Key, "-username"):
+						if endpoints[i].parserEndpoint.username == nil {
+							endpoints[i].parserEndpoint.username = new(references)
+						}
+						endpoints[i].parserEndpoint.username.Secret = secret.Key
+					case strings.HasSuffix(secret.Key, "-password"):
+						if endpoints[i].parserEndpoint.password == nil {
+							endpoints[i].parserEndpoint.password = new(references)
+						}
+						endpoints[i].parserEndpoint.password.Secret = secret.Key
 					}
-					endpoints[i].parserEndpoint.routingKey.Secret = secret.Key
-				case strings.HasSuffix(secret.Key, "-token"):
-					if endpoints[i].parserEndpoint.token == nil {
-						endpoints[i].parserEndpoint.token = new(references)
-					}
-					endpoints[i].parserEndpoint.token.Secret = secret.Key
-				case strings.HasSuffix(secret.Key, "-username"):
-					if endpoints[i].parserEndpoint.username == nil {
-						endpoints[i].parserEndpoint.username = new(references)
-					}
-					endpoints[i].parserEndpoint.username.Secret = secret.Key
-				case strings.HasSuffix(secret.Key, "-password"):
-					if endpoints[i].parserEndpoint.password == nil {
-						endpoints[i].parserEndpoint.password = new(references)
-					}
-					endpoints[i].parserEndpoint.password.Secret = secret.Key
 				}
 			}
 			rollbackEndpoints = append(rollbackEndpoints, endpoints[i])
@@ -1748,14 +1845,14 @@ func (s *Service) applyNotificationEndpoints(ctx context.Context, userID influxd
 }
 
 func (s *Service) applyNotificationEndpoint(ctx context.Context, e *stateEndpoint, userID influxdb.ID) (influxdb.NotificationEndpoint, error) {
-	switch e.stateStatus {
-	case StateStatusRemove:
+	switch {
+	case IsRemoval(e.stateStatus):
 		_, _, err := s.endpointSVC.DeleteNotificationEndpoint(ctx, e.ID())
-		if err != nil {
+		if err != nil && influxdb.ErrorCode(err) != influxdb.ENotFound {
 			return nil, err
 		}
 		return e.existing, nil
-	case StateStatusExists:
+	case IsExisting(e.stateStatus) && e.existing != nil:
 		// stub out userID since we're always using hte http client which will fill it in for us with the token
 		// feels a bit broken that is required.
 		// TODO: look into this userID requirement
@@ -1778,6 +1875,9 @@ func (s *Service) applyNotificationEndpoint(ctx context.Context, e *stateEndpoin
 
 func (s *Service) rollbackNotificationEndpoints(ctx context.Context, userID influxdb.ID, endpoints []*stateEndpoint) error {
 	rollbackFn := func(e *stateEndpoint) error {
+		if !IsNew(e.stateStatus) && e.existing == nil {
+			return nil
+		}
 		var err error
 		switch e.stateStatus {
 		case StateStatusRemove:
@@ -1821,7 +1921,7 @@ func (s *Service) applyNotificationGenerator(ctx context.Context, userID influxd
 		v, ok := mEndpoints[r.endpointPkgName()]
 		if !ok {
 			errs = append(errs, &applyErrBody{
-				name: r.parserRule.Name(),
+				name: r.parserRule.PkgName(),
 				msg:  fmt.Sprintf("notification rule endpoint dependency does not exist; endpointName=%q", r.parserRule.associatedEndpoint.PkgName()),
 			})
 			continue
@@ -1873,7 +1973,9 @@ func (s *Service) applyNotificationRules(ctx context.Context, userID influxdb.ID
 		}
 
 		mutex.Do(func() {
-			rules[i].id = influxRule.GetID()
+			if influxRule != nil {
+				rules[i].id = influxRule.GetID()
+			}
 			rollbackEndpoints = append(rollbackEndpoints, rules[i])
 		})
 
@@ -1896,13 +1998,16 @@ func (s *Service) applyNotificationRules(ctx context.Context, userID influxdb.ID
 }
 
 func (s *Service) applyNotificationRule(ctx context.Context, r *stateRule, userID influxdb.ID) (influxdb.NotificationRule, error) {
-	switch r.stateStatus {
-	case StateStatusRemove:
+	switch {
+	case IsRemoval(r.stateStatus):
 		if err := s.ruleSVC.DeleteNotificationRule(ctx, r.ID()); err != nil {
+			if influxdb.ErrorCode(err) == influxdb.ENotFound {
+				return nil, nil
+			}
 			return nil, ierrors.Wrap(err, "failed to remove notification rule")
 		}
 		return r.existing, nil
-	case StateStatusExists:
+	case IsExisting(r.stateStatus) && r.existing != nil:
 		ruleCreate := influxdb.NotificationRuleCreate{
 			NotificationRule: r.toInfluxRule(),
 			Status:           r.parserRule.Status(),
@@ -1927,6 +2032,10 @@ func (s *Service) applyNotificationRule(ctx context.Context, r *stateRule, userI
 
 func (s *Service) rollbackNotificationRules(ctx context.Context, userID influxdb.ID, rules []*stateRule) error {
 	rollbackFn := func(r *stateRule) error {
+		if !IsNew(r.stateStatus) && r.existing == nil {
+			return nil
+		}
+
 		existingRuleFn := func(endpointID influxdb.ID) influxdb.NotificationRule {
 			switch rr := r.existing.(type) {
 			case *rule.HTTP:
@@ -2046,7 +2155,7 @@ func (s *Service) applyTasks(ctx context.Context, tasks []*stateTask) applier {
 		newTask, err := s.applyTask(ctx, userID, t)
 		if err != nil {
 			return &applyErrBody{
-				name: t.parserTask.Name(),
+				name: t.parserTask.PkgName(),
 				msg:  err.Error(),
 			}
 		}
@@ -2074,13 +2183,16 @@ func (s *Service) applyTasks(ctx context.Context, tasks []*stateTask) applier {
 }
 
 func (s *Service) applyTask(ctx context.Context, userID influxdb.ID, t *stateTask) (influxdb.Task, error) {
-	switch t.stateStatus {
-	case StateStatusRemove:
+	switch {
+	case IsRemoval(t.stateStatus):
 		if err := s.taskSVC.DeleteTask(ctx, t.ID()); err != nil {
+			if influxdb.ErrorCode(err) == influxdb.ENotFound {
+				return influxdb.Task{}, nil
+			}
 			return influxdb.Task{}, ierrors.Wrap(err, "failed to delete task")
 		}
 		return *t.existing, nil
-	case StateStatusExists:
+	case IsExisting(t.stateStatus) && t.existing != nil:
 		newFlux := t.parserTask.flux()
 		newStatus := string(t.parserTask.Status())
 		opt := options.Options{
@@ -2122,6 +2234,10 @@ func (s *Service) applyTask(ctx context.Context, userID influxdb.ID, t *stateTas
 
 func (s *Service) rollbackTasks(ctx context.Context, tasks []*stateTask) error {
 	rollbackFn := func(t *stateTask) error {
+		if !IsNew(t.stateStatus) && t.existing == nil {
+			return nil
+		}
+
 		var err error
 		switch t.stateStatus {
 		case StateStatusRemove:
@@ -2196,7 +2312,7 @@ func (s *Service) applyTelegrafs(ctx context.Context, userID influxdb.ID, teles 
 		existing, err := s.applyTelegrafConfig(ctx, userID, t)
 		if err != nil {
 			return &applyErrBody{
-				name: t.parserTelegraf.Name(),
+				name: t.parserTelegraf.PkgName(),
 				msg:  err.Error(),
 			}
 		}
@@ -2224,13 +2340,16 @@ func (s *Service) applyTelegrafs(ctx context.Context, userID influxdb.ID, teles 
 }
 
 func (s *Service) applyTelegrafConfig(ctx context.Context, userID influxdb.ID, t *stateTelegraf) (influxdb.TelegrafConfig, error) {
-	switch t.stateStatus {
-	case StateStatusRemove:
+	switch {
+	case IsRemoval(t.stateStatus):
 		if err := s.teleSVC.DeleteTelegrafConfig(ctx, t.ID()); err != nil {
+			if influxdb.ErrorCode(err) == influxdb.ENotFound {
+				return influxdb.TelegrafConfig{}, nil
+			}
 			return influxdb.TelegrafConfig{}, ierrors.Wrap(err, "failed to delete config")
 		}
 		return *t.existing, nil
-	case StateStatusExists:
+	case IsExisting(t.stateStatus) && t.existing != nil:
 		cfg := t.summarize().TelegrafConfig
 		updatedConfig, err := s.teleSVC.UpdateTelegrafConfig(ctx, t.ID(), &cfg, userID)
 		if err != nil {
@@ -2249,6 +2368,10 @@ func (s *Service) applyTelegrafConfig(ctx context.Context, userID influxdb.ID, t
 
 func (s *Service) rollbackTelegrafConfigs(ctx context.Context, userID influxdb.ID, cfgs []*stateTelegraf) error {
 	rollbackFn := func(t *stateTelegraf) error {
+		if !IsNew(t.stateStatus) && t.existing == nil {
+			return nil
+		}
+
 		var err error
 		switch t.stateStatus {
 		case StateStatusRemove:
@@ -2294,7 +2417,7 @@ func (s *Service) applyVariables(ctx context.Context, vars []*stateVariable) app
 		influxVar, err := s.applyVariable(ctx, v)
 		if err != nil {
 			return &applyErrBody{
-				name: v.parserVar.Name(),
+				name: v.parserVar.PkgName(),
 				msg:  err.Error(),
 			}
 		}
@@ -2321,14 +2444,20 @@ func (s *Service) applyVariables(ctx context.Context, vars []*stateVariable) app
 func (s *Service) rollbackVariables(ctx context.Context, variables []*stateVariable) error {
 	rollbackFn := func(v *stateVariable) error {
 		var err error
-		switch v.stateStatus {
-		case StateStatusRemove:
+		switch {
+		case IsRemoval(v.stateStatus):
+			if v.existing == nil {
+				return nil
+			}
 			err = ierrors.Wrap(s.varSVC.CreateVariable(ctx, v.existing), "rolling back removed variable")
-		case StateStatusExists:
+		case IsExisting(v.stateStatus):
+			if v.existing == nil {
+				return nil
+			}
 			_, err = s.varSVC.UpdateVariable(ctx, v.ID(), &influxdb.VariableUpdate{
-				Name:        v.parserVar.Name(),
-				Description: v.parserVar.Description,
-				Arguments:   v.parserVar.influxVarArgs(),
+				Name:        v.existing.Name,
+				Description: v.existing.Description,
+				Arguments:   v.existing.Arguments,
 			})
 			err = ierrors.Wrap(err, "rolling back updated variable")
 		default:
@@ -2352,23 +2481,28 @@ func (s *Service) rollbackVariables(ctx context.Context, variables []*stateVaria
 }
 
 func (s *Service) applyVariable(ctx context.Context, v *stateVariable) (influxdb.Variable, error) {
-	switch v.stateStatus {
-	case StateStatusRemove:
-		if err := s.varSVC.DeleteVariable(ctx, v.id); err != nil {
-			return influxdb.Variable{}, err
+	switch {
+	case IsRemoval(v.stateStatus):
+		if err := s.varSVC.DeleteVariable(ctx, v.id); err != nil && influxdb.ErrorCode(err) != influxdb.ENotFound {
+			return influxdb.Variable{}, ierrors.Wrap(err, "removing existing variable")
+		}
+		if v.existing == nil {
+			return influxdb.Variable{}, nil
 		}
 		return *v.existing, nil
-	case StateStatusExists:
+	case IsExisting(v.stateStatus) && v.existing != nil:
 		updatedVar, err := s.varSVC.UpdateVariable(ctx, v.ID(), &influxdb.VariableUpdate{
 			Name:        v.parserVar.Name(),
 			Description: v.parserVar.Description,
 			Arguments:   v.parserVar.influxVarArgs(),
 		})
 		if err != nil {
-			return influxdb.Variable{}, err
+			return influxdb.Variable{}, ierrors.Wrap(err, "updating existing variable")
 		}
 		return *updatedVar, nil
 	default:
+		// when an existing variable (referenced in stack) has been deleted by a user
+		// then the resource is created anew to get it back to the expected state.
 		influxVar := influxdb.Variable{
 			OrganizationID: v.orgID,
 			Name:           v.parserVar.Name(),
@@ -2377,9 +2511,8 @@ func (s *Service) applyVariable(ctx context.Context, v *stateVariable) (influxdb
 		}
 		err := s.varSVC.CreateVariable(ctx, &influxVar)
 		if err != nil {
-			return influxdb.Variable{}, err
+			return influxdb.Variable{}, ierrors.Wrap(err, "creating new variable")
 		}
-
 		return influxVar, nil
 	}
 }
@@ -2523,6 +2656,47 @@ func (s *Service) rollbackLabelMappings(ctx context.Context, mappings []stateLab
 	}
 
 	return nil
+}
+
+func (s *Service) getStackRemotePackages(ctx context.Context, stackID influxdb.ID) ([]*Pkg, error) {
+	stack, err := s.store.ReadStackByID(ctx, stackID)
+	if err != nil {
+		return nil, err
+	}
+
+	var remotePkgs []*Pkg
+	for _, rawURL := range stack.URLs {
+		u, err := url.Parse(rawURL)
+		if err != nil {
+			return nil, &influxdb.Error{
+				Code: influxdb.EInternal,
+				Msg:  "failed to parse url",
+				Err:  err,
+			}
+		}
+
+		encoding := EncodingSource
+		switch path.Ext(u.String()) {
+		case ".jsonnet":
+			encoding = EncodingJsonnet
+		case ".json":
+			encoding = EncodingJSON
+		case ".yaml", ".yml":
+			encoding = EncodingYAML
+		}
+
+		readerFn := FromHTTPRequest(u.String())
+		if u.Scheme == "file" {
+			readerFn = FromFile(u.Path)
+		}
+
+		pkg, err := Parse(encoding, readerFn)
+		if err != nil {
+			return nil, err
+		}
+		remotePkgs = append(remotePkgs, pkg)
+	}
+	return remotePkgs, nil
 }
 
 func (s *Service) updateStackAfterSuccess(ctx context.Context, stackID influxdb.ID, state *stateCoordinator) error {

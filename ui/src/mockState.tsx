@@ -25,6 +25,11 @@ export const localState: LocalStorage = {
       theme: 'dark',
     },
   },
+  flags: {
+    status: RemoteDataState.Done,
+    original: {},
+    override: {},
+  },
   VERSION: '2.0.0',
   ranges: {
     '0349ecda531ea000': pastFifteenMinTimeRange,

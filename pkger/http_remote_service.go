@@ -55,6 +55,34 @@ func (s *HTTPRemoteService) InitStack(ctx context.Context, userID influxdb.ID, s
 	return newStack, nil
 }
 
+func (s *HTTPRemoteService) DeleteStack(ctx context.Context, identifiers struct{ OrgID, UserID, StackID influxdb.ID }) error {
+	return s.Client.
+		Delete(RoutePrefix, "stacks", identifiers.StackID.String()).
+		QueryParams([2]string{"orgID", identifiers.OrgID.String()}).
+		Do(ctx)
+}
+
+func (s *HTTPRemoteService) ListStacks(ctx context.Context, orgID influxdb.ID, f ListFilter) ([]Stack, error) {
+	queryParams := [][2]string{{"orgID", orgID.String()}}
+	for _, name := range f.Names {
+		queryParams = append(queryParams, [2]string{"name", name})
+	}
+	for _, stackID := range f.StackIDs {
+		queryParams = append(queryParams, [2]string{"stackID", stackID.String()})
+	}
+
+	var resp RespListStacks
+	err := s.Client.
+		Get(RoutePrefix, "/stacks").
+		QueryParams(queryParams...).
+		DecodeJSON(&resp).
+		Do(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Stacks, nil
+}
+
 // CreatePkg will produce a pkg from the parameters provided.
 func (s *HTTPRemoteService) CreatePkg(ctx context.Context, setters ...CreatePkgSetFn) (*Pkg, error) {
 	var opt CreateOpt
@@ -119,9 +147,13 @@ func (s *HTTPRemoteService) Apply(ctx context.Context, orgID, userID influxdb.ID
 func (s *HTTPRemoteService) apply(ctx context.Context, orgID influxdb.ID, pkg *Pkg, dryRun bool, opts ...ApplyOptFn) (Summary, Diff, error) {
 	opt := applyOptFromOptFns(opts...)
 
-	b, err := pkg.Encode(EncodingJSON)
-	if err != nil {
-		return Summary{}, Diff{}, err
+	var rawPkg []byte
+	if pkg != nil {
+		b, err := pkg.Encode(EncodingJSON)
+		if err != nil {
+			return Summary{}, Diff{}, err
+		}
+		rawPkg = b
 	}
 
 	reqBody := ReqApplyPkg{
@@ -129,7 +161,7 @@ func (s *HTTPRemoteService) apply(ctx context.Context, orgID influxdb.ID, pkg *P
 		DryRun:  dryRun,
 		EnvRefs: opt.EnvRefs,
 		Secrets: opt.MissingSecrets,
-		RawPkg:  b,
+		RawPkg:  rawPkg,
 	}
 	if opt.StackID != 0 {
 		stackID := opt.StackID.String()
@@ -137,7 +169,7 @@ func (s *HTTPRemoteService) apply(ctx context.Context, orgID influxdb.ID, pkg *P
 	}
 
 	var resp RespApplyPkg
-	err = s.Client.
+	err := s.Client.
 		PostJSON(reqBody, RoutePrefix, "/apply").
 		DecodeJSON(&resp).
 		Do(ctx)
